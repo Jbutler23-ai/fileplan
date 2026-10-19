@@ -259,7 +259,7 @@ class FileplanTests(unittest.TestCase):
                     plan = fileplan.build_plan(self.root, recursive=True, include_hidden=True)
                 self.assertEqual(set(self.entries_by_source(plan)), {"report.txt"})
                 self.assertIn("linked", {item["path"] for item in plan["skipped"]})
-                scandir.assert_called_once_with(self.root)
+                scandir.assert_called_once_with(self.root.resolve())
                 link.stat.assert_called_once_with(follow_symlinks=False)
 
     def test_destination_link_or_junction_blocks_the_plan(self):
@@ -276,7 +276,7 @@ class FileplanTests(unittest.TestCase):
                     plan = fileplan.build_plan(self.root, recursive=True)
                 self.assertEqual(plan["summary"]["conflicts"], 1)
                 self.assertTrue(plan["entries"][0]["reason"])
-                scandir.assert_called_once_with(self.root)
+                scandir.assert_called_once_with(self.root.resolve())
 
     def test_example_runs_through_the_command_line(self):
         script = Path(fileplan.__file__).resolve()
