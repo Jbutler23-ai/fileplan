@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build distributions
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Install wheel
+        shell: bash
+        run: python -m pip install --no-deps dist/*.whl
+      - name: Check installed command
+        working-directory: examples
+        run: fileplan inbox --strict --format json
+      - name: Check editable install
+        run: |
+          python -m pip install --no-deps --editable .
+          fileplan examples/inbox --strict --format json

@@ -1,0 +1,1 @@
+Another sample file with the same name, used to demonstrate a conflict.
