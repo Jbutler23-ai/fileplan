@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "name": "writing",
+      "extensions": ["md", "rst"],
+      "folder": "writing"
+    },
+    {
+      "name": "assets",
+      "extensions": ["json", "svg", "png"],
+      "folder": "assets"
+    },
+    {
+      "name": "checklists",
+      "patterns": ["CHECKLIST*", "todo-*"],
+      "folder": "lists"
+    }
+  ],
+  "fallback": "by-extension"
+}
