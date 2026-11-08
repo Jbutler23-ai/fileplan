@@ -30,6 +30,7 @@ import platform
 import stat
 import sys
 from typing import TextIO
+import unicodedata
 
 
 DESTINATION_NAME = "_organized"
@@ -387,22 +388,43 @@ def _apply_choices(entries: list[dict], root: Path, snapshot: _DirectorySnapshot
     _assess_destinations(active, root, snapshot)
 
 
-def _digest(fd: int) -> str:
+# O_BINARY matters on Windows: without it os.open uses text mode, where a read
+# stops at the first Ctrl-Z byte and two different files could hash the same.
+_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_BINARY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+class _ShortRead(OSError):
+    """Fewer bytes were read than the file holds."""
+
+
+def _digest(fd: int, expected_size: int) -> str:
+    """Hash every byte from fd; refuse if the count differs from expected_size."""
     digest = hashlib.sha256()
+    count = 0
     while True:
         chunk = os.read(fd, _HASH_CHUNK)
         if not chunk:
-            return digest.hexdigest()
+            break
+        count += len(chunk)
         digest.update(chunk)
+    if count != expected_size:
+        raise _ShortRead(
+            errno.EIO, f"read {count} of {expected_size} bytes, so contents were not compared"
+        )
+    return digest.hexdigest()
 
 
 def _hash_file(
     path: Path, label: str, size_bytes: int, modified_ns: int
 ) -> tuple[str | None, str | None]:
     """Hash one file's contents, refusing links and noticing a change meanwhile."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(path, flags)
+        fd = os.open(path, _READ_FLAGS)
     except OSError as error:
         return None, f"Cannot read {label} for the duplicate check: {error.strerror or error}"
     try:
@@ -411,7 +433,7 @@ def _hash_file(
             return None, f"{label} is not a regular file"
         if (before.st_size, before.st_mtime_ns) != (size_bytes, modified_ns):
             return None, f"{label} changed before the duplicate check"
-        digest = _digest(fd)
+        digest = _digest(fd, before.st_size)
         after = os.fstat(fd)
         if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
             return None, f"{label} changed during the duplicate check"
@@ -888,12 +910,13 @@ _OPENED_A_LINK = frozenset(
 )
 
 
-# The only change fileplan makes to disk is one Linux system call: renameat2
-# with RENAME_NOREPLACE. It gives the file its new name and removes the old
-# one in a single step, and the kernel refuses if the new name is taken. Every
-# other step acts relative to folders opened without following links. When a
-# platform cannot do exactly this, applying stops rather than trying another
-# method. Only Linux offers the call, so only Linux can apply a plan for now.
+# The only change fileplan makes to disk is one rename that refuses to
+# replace: on Linux the renameat2 system call with RENAME_NOREPLACE, on Windows
+# the NT rename with ReplaceIfExists off (see _WindowsFiles). It gives the file
+# its new name and removes the old one in a single step, and the system refuses
+# if the new name is taken. Every other step acts relative to folders opened
+# without following links. When a platform cannot do exactly this, applying
+# stops rather than trying another method.
 _RENAME_NOREPLACE = 1
 # Kernel system-call numbers, used only when the C library lacks the wrapper.
 _RENAMEAT2_SYSCALLS = {
@@ -962,8 +985,412 @@ def _load_renameat2():
 _RENAMEAT2 = _load_renameat2()
 
 
+class _WindowsFiles:
+    """The same handle-relative steps as on Linux, through the Windows NT API.
+
+    Python's os module cannot open a name relative to a folder handle on
+    Windows, but the NT layer underneath always could. Every handle opened here
+    is wrapped as an ordinary C runtime descriptor, so os.fstat, os.read,
+    os.write, os.dup and os.close keep working on it unchanged.
+
+    - A folder is opened relative to its parent's handle, with
+      FILE_OPEN_REPARSE_POINT so a junction or link is opened as itself and
+      then refused, never entered.
+    - Folder handles are opened without FILE_SHARE_DELETE. While fileplan holds
+      one, Windows refuses to let anything rename, move, or delete that folder,
+      so the folder checked is the folder used.
+    - The move is NtSetInformationFile(FileRenameInformation) with
+      ReplaceIfExists false and the destination folder's handle as its root:
+      one step, refused by the filesystem if the new name is taken.
+    """
+
+    _SYNCHRONIZE = 0x00100000
+    _DELETE = 0x00010000
+    _FILE_READ_DATA = 0x0001
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_TRAVERSE = 0x0020
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _FILE_GENERIC_READ = 0x00120089
+    _FILE_GENERIC_WRITE = 0x00120116
+    _SHARE_READ, _SHARE_WRITE, _SHARE_DELETE = 1, 2, 4
+    _FILE_OPEN, _FILE_CREATE = 1, 2
+    _FILE_DIRECTORY_FILE = 0x00000001
+    _FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+    _FILE_NON_DIRECTORY_FILE = 0x00000040
+    _FILE_OPEN_REPARSE_POINT = 0x00200000
+    _OBJ_CASE_INSENSITIVE = 0x00000040
+    _FILE_RENAME_INFORMATION = 10
+    _FILE_FULL_DIRECTORY_INFO = 14
+    _FILE_FULL_DIRECTORY_RESTART_INFO = 15
+    _ERROR_NO_MORE_FILES = 18
+    # The run record's access list, the Windows form of mode 0600: full access
+    # for the file's owner and the system, nothing inherited, no one else.
+    PRIVATE_FILE_SDDL = "D:P(A;;FA;;;OW)(A;;FA;;;SY)"
+    # NTSTATUS values mapped to the errno the rest of fileplan already handles.
+    _STATUS_ERRNO = {
+        0xC0000035: errno.EEXIST,  # OBJECT_NAME_COLLISION
+        0xC0000034: errno.ENOENT,  # OBJECT_NAME_NOT_FOUND
+        0xC000003A: errno.ENOENT,  # OBJECT_PATH_NOT_FOUND
+        0xC0000103: errno.ENOTDIR,  # NOT_A_DIRECTORY
+        0xC00000BA: errno.EISDIR,  # FILE_IS_A_DIRECTORY
+        0xC00000D4: errno.EXDEV,  # NOT_SAME_DEVICE
+        0xC0000022: errno.EACCES,  # ACCESS_DENIED
+        0xC0000043: errno.EACCES,  # SHARING_VIOLATION
+        0xC0000056: errno.EACCES,  # DELETE_PENDING
+        0xC0000121: errno.EACCES,  # CANNOT_DELETE
+        0xC0000002: errno.EINVAL,  # NOT_IMPLEMENTED
+        0xC000000D: errno.EINVAL,  # INVALID_PARAMETER
+        0xC0000010: errno.EINVAL,  # INVALID_DEVICE_REQUEST
+        0xC00000BB: errno.EINVAL,  # NOT_SUPPORTED
+    }
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        import msvcrt
+
+        self._ctypes = ctypes
+        self._msvcrt = msvcrt
+        self._ntdll = ctypes.WinDLL("ntdll")
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class UnicodeString(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.USHORT),
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", wintypes.LPWSTR),
+            ]
+
+        class ObjectAttributes(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.ULONG),
+                ("RootDirectory", wintypes.HANDLE),
+                ("ObjectName", ctypes.POINTER(UnicodeString)),
+                ("Attributes", wintypes.ULONG),
+                ("SecurityDescriptor", wintypes.LPVOID),
+                ("SecurityQualityOfService", wintypes.LPVOID),
+            ]
+
+        class IoStatusBlock(ctypes.Structure):
+            _fields_ = [("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t)]
+
+        class RenameInformation(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", ctypes.c_ubyte),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.ULONG),
+                ("FileName", ctypes.c_wchar * 1),
+            ]
+
+        self._UnicodeString = UnicodeString
+        self._ObjectAttributes = ObjectAttributes
+        self._IoStatusBlock = IoStatusBlock
+        self._RenameInformation = RenameInformation
+
+        nt = self._ntdll
+        nt.NtCreateFile.restype = ctypes.c_ulong
+        nt.NtCreateFile.argtypes = [
+            ctypes.POINTER(wintypes.HANDLE), wintypes.ULONG,
+            ctypes.POINTER(ObjectAttributes), ctypes.POINTER(IoStatusBlock),
+            ctypes.c_void_p, wintypes.ULONG, wintypes.ULONG, wintypes.ULONG,
+            wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+        ]
+        nt.NtSetInformationFile.restype = ctypes.c_ulong
+        nt.NtSetInformationFile.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(IoStatusBlock), ctypes.c_void_p,
+            wintypes.ULONG, ctypes.c_int,
+        ]
+        nt.RtlNtStatusToDosError.restype = wintypes.ULONG
+        nt.RtlNtStatusToDosError.argtypes = [ctypes.c_ulong]
+        self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ]
+        k32 = self._kernel32
+        k32.LocalFree.argtypes = [ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        k32.GetFileInformationByHandleEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        k32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+        k32.GetFinalPathNameByHandleW.argtypes = [
+            wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+        ]
+
+    @staticmethod
+    def _utf16(name: str) -> bytes:
+        """The name as Windows stores it: UTF-16, keeping any lone surrogate."""
+        return name.encode("utf-16-le", "surrogatepass")
+
+    def _error(self, status: int, name: str | None) -> OSError:
+        code = self._STATUS_ERRNO.get(status, errno.EIO)
+        message = self._ctypes.FormatError(
+            self._ntdll.RtlNtStatusToDosError(status)
+        ).strip()
+        return OSError(code, message or f"NTSTATUS {status:#010x}", name)
+
+    def _create(
+        self, parent: int | None, name: str, access: int, share: int,
+        disposition: int, options: int, security: object = None,
+    ) -> int:
+        """NtCreateFile relative to parent's handle; return the raw HANDLE."""
+        ctypes = self._ctypes
+        # Windows measures names in UTF-16 code units, not characters. An emoji
+        # or any other character outside the Basic Multilingual Plane takes two
+        # units, so len(name) * 2 would cut such names short.
+        size = len(self._utf16(name))
+        text = self._UnicodeString(size, size, name)
+        root = self._msvcrt.get_osfhandle(parent) if parent is not None else None
+        attributes = self._ObjectAttributes(
+            ctypes.sizeof(self._ObjectAttributes), root, ctypes.pointer(text),
+            self._OBJ_CASE_INSENSITIVE, security, None,
+        )
+        handle = ctypes.c_void_p()
+        status_block = self._IoStatusBlock()
+        status = self._ntdll.NtCreateFile(
+            ctypes.cast(ctypes.byref(handle), ctypes.POINTER(ctypes.wintypes.HANDLE)),
+            access | self._SYNCHRONIZE, ctypes.byref(attributes),
+            ctypes.byref(status_block), None, 0, share, disposition,
+            options | self._FILE_SYNCHRONOUS_IO_NONALERT | self._FILE_OPEN_REPARSE_POINT,
+            None, 0,
+        )
+        if status != 0:
+            raise self._error(status, name)
+        return handle.value
+
+    def _wrap(self, handle: int, flags: int, refuse_links: bool, name: str) -> int:
+        """Turn a raw HANDLE into a C runtime descriptor; refuse reparse points."""
+        try:
+            fd = self._msvcrt.open_osfhandle(handle, flags)
+        except OSError:
+            self._kernel32.CloseHandle(handle)
+            raise
+        if refuse_links:
+            try:
+                attributes = os.fstat(fd).st_file_attributes
+            except OSError:
+                os.close(fd)
+                raise
+            if attributes & _REPARSE_POINT:
+                os.close(fd)
+                raise OSError(errno.ELOOP, "Is a link or reparse point", name)
+        return fd
+
+    def _directory(self, parent: int | None, name: str, disposition: int) -> int:
+        return self._create(
+            parent, name,
+            self._FILE_LIST_DIRECTORY | self._FILE_TRAVERSE | self._FILE_READ_ATTRIBUTES,
+            self._SHARE_READ | self._SHARE_WRITE,  # never SHARE_DELETE: pins it
+            disposition, self._FILE_DIRECTORY_FILE,
+        )
+
+    def open_root(self, path: str | os.PathLike) -> int:
+        full = os.path.abspath(os.fspath(path))
+        if full.startswith("\\\\?\\"):
+            nt_path = "\\??\\" + full[4:]
+        elif full.startswith("\\\\"):
+            nt_path = "\\??\\UNC\\" + full[2:]
+        else:
+            nt_path = "\\??\\" + full
+        handle = self._directory(None, nt_path, self._FILE_OPEN)
+        return self._wrap(handle, os.O_RDONLY, True, full)
+
+    def open_dir_at(self, parent: int, name: str) -> int:
+        handle = self._directory(parent, name, self._FILE_OPEN)
+        return self._wrap(handle, os.O_RDONLY, True, name)
+
+    def mkdir_at(self, parent: int, name: str) -> None:
+        handle = self._directory(parent, name, self._FILE_CREATE)
+        self._kernel32.CloseHandle(handle)
+
+    def stat_at(self, parent: int, name: str) -> os.stat_result:
+        """Like os.stat(follow_symlinks=False): a link is described, not followed."""
+        handle = self._create(
+            parent, name, self._FILE_READ_ATTRIBUTES,
+            self._SHARE_READ | self._SHARE_WRITE | self._SHARE_DELETE,
+            self._FILE_OPEN, 0,
+        )
+        fd = self._wrap(handle, os.O_RDONLY, False, name)
+        try:
+            return os.fstat(fd)
+        finally:
+            os.close(fd)
+
+    def open_read_at(self, parent: int, name: str) -> int:
+        handle = self._create(
+            parent, name, self._FILE_READ_DATA | self._FILE_READ_ATTRIBUTES,
+            self._SHARE_READ | self._SHARE_WRITE | self._SHARE_DELETE,
+            self._FILE_OPEN, self._FILE_NON_DIRECTORY_FILE,
+        )
+        return self._wrap(handle, os.O_RDONLY | os.O_BINARY, True, name)
+
+    def create_new_at(self, parent: int, name: str) -> int:
+        """A new file for appending; FileExistsError if the name is taken."""
+        ctypes = self._ctypes
+        descriptor = ctypes.c_void_p()
+        if not self._advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            self.PRIVATE_FILE_SDDL, 1, ctypes.byref(descriptor), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            handle = self._create(
+                parent, name, self._FILE_GENERIC_READ | self._FILE_GENERIC_WRITE,
+                self._SHARE_READ, self._FILE_CREATE, self._FILE_NON_DIRECTORY_FILE,
+                descriptor,
+            )
+        finally:
+            self._kernel32.LocalFree(descriptor)
+        return self._wrap(handle, os.O_APPEND | os.O_BINARY, True, name)
+
+    def list_names(self, fd: int) -> list[str]:
+        ctypes = self._ctypes
+        handle = self._msvcrt.get_osfhandle(fd)
+        buffer = ctypes.create_string_buffer(64 * 1024)
+        names: list[str] = []
+        info_class = self._FILE_FULL_DIRECTORY_RESTART_INFO
+        while True:
+            if not self._kernel32.GetFileInformationByHandleEx(
+                handle, info_class, buffer, len(buffer)
+            ):
+                code = ctypes.get_last_error()
+                if code == self._ERROR_NO_MORE_FILES:
+                    return [name for name in names if name not in (".", "..")]
+                raise ctypes.WinError(code)
+            info_class = self._FILE_FULL_DIRECTORY_INFO
+            raw = buffer.raw
+            offset = 0
+            while True:
+                # FILE_FULL_DIR_INFO: NextEntryOffset @0, FileNameLength @60, FileName @68
+                following = int.from_bytes(raw[offset : offset + 4], "little")
+                length = int.from_bytes(raw[offset + 60 : offset + 64], "little")
+                names.append(
+                    raw[offset + 68 : offset + 68 + length].decode(
+                        "utf-16-le", "surrogatepass"
+                    )
+                )
+                if not following:
+                    break
+                offset += following
+
+    def rename_noreplace(
+        self, src_fd: int, src_name: str, dst_fd: int, dst_name: str
+    ) -> None:
+        ctypes = self._ctypes
+        handle = self._create(
+            src_fd, src_name, self._DELETE | self._FILE_READ_ATTRIBUTES,
+            self._SHARE_READ | self._SHARE_WRITE | self._SHARE_DELETE,
+            self._FILE_OPEN, self._FILE_NON_DIRECTORY_FILE,
+        )
+        fd = self._wrap(handle, os.O_RDONLY, True, src_name)
+        try:
+            encoded = self._utf16(dst_name)
+            offset = self._RenameInformation.FileName.offset
+            buffer = ctypes.create_string_buffer(
+                max(offset + len(encoded) + 2, ctypes.sizeof(self._RenameInformation))
+            )
+            info = self._RenameInformation.from_buffer(buffer)
+            info.ReplaceIfExists = 0
+            info.RootDirectory = self._msvcrt.get_osfhandle(dst_fd)
+            info.FileNameLength = len(encoded)
+            ctypes.memmove(ctypes.addressof(buffer) + offset, encoded, len(encoded))
+            del info
+            status_block = self._IoStatusBlock()
+            status = self._ntdll.NtSetInformationFile(
+                self._msvcrt.get_osfhandle(fd), ctypes.byref(status_block),
+                buffer, len(buffer), self._FILE_RENAME_INFORMATION,
+            )
+        finally:
+            os.close(fd)
+        if status != 0:
+            error = self._error(status, src_name)
+            raise OSError(error.errno, error.strerror, src_name, None, dst_name)
+
+    def handle_path(self, fd: int) -> str | None:
+        ctypes = self._ctypes
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = self._kernel32.GetFinalPathNameByHandleW(
+            self._msvcrt.get_osfhandle(fd), buffer, len(buffer), 0
+        )
+        if not 0 < length < len(buffer):
+            return None
+        path = buffer.value
+        if path.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + path[8:]
+        if path.startswith("\\\\?\\"):
+            return path[4:]
+        return path
+
+
+def _load_windows_files() -> _WindowsFiles | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        return _WindowsFiles()
+    except (ImportError, OSError, AttributeError):
+        return None
+
+
+_WINDOWS = _load_windows_files()
+
+
+# Handle-relative steps. On Linux each is the os call with dir_fd; on Windows
+# each is the matching NT call above. Both refuse to follow links.
+def _open_root(path: str | os.PathLike) -> int:
+    if _WINDOWS is not None:
+        return _WINDOWS.open_root(path)
+    return os.open(path, _DIRECTORY_FLAGS)
+
+
+def _open_dir_at(dir_fd: int, name: str) -> int:
+    if _WINDOWS is not None:
+        return _WINDOWS.open_dir_at(dir_fd, name)
+    return os.open(name, _DIRECTORY_FLAGS, dir_fd=dir_fd)
+
+
+def _mkdir_at(dir_fd: int, name: str) -> None:
+    if _WINDOWS is not None:
+        return _WINDOWS.mkdir_at(dir_fd, name)
+    os.mkdir(name, dir_fd=dir_fd)
+
+
+def _stat_at(dir_fd: int, name: str) -> os.stat_result:
+    if _WINDOWS is not None:
+        return _WINDOWS.stat_at(dir_fd, name)
+    return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+
+
+def _open_read_at(dir_fd: int, name: str) -> int:
+    if _WINDOWS is not None:
+        return _WINDOWS.open_read_at(dir_fd, name)
+    return os.open(name, _READ_FLAGS, dir_fd=dir_fd)
+
+
+def _create_new_at(dir_fd: int, name: str) -> int:
+    if _WINDOWS is not None:
+        return _WINDOWS.create_new_at(dir_fd, name)
+    flags = (
+        os.O_WRONLY
+        | os.O_APPEND
+        | os.O_CREAT
+        | os.O_EXCL
+        | _O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    return os.open(name, flags, 0o600, dir_fd=dir_fd)
+
+
+def _list_names(directory: Path | int) -> list[str]:
+    if _WINDOWS is not None and isinstance(directory, int):
+        return _WINDOWS.list_names(directory)
+    with os.scandir(directory) as iterator:
+        return [entry.name for entry in iterator]
+
+
 def _rename_noreplace(src_fd: int, src_name: str, dst_fd: int, dst_name: str) -> None:
     """Rename within open folders, refusing to replace anything at the new name."""
+    if _WINDOWS is not None:
+        return _WINDOWS.rename_noreplace(src_fd, src_name, dst_fd, dst_name)
     result = _RENAMEAT2(
         src_fd, os.fsencode(src_name), dst_fd, os.fsencode(dst_name), _RENAME_NOREPLACE
     )
@@ -979,15 +1406,15 @@ _NOREPLACE_UNSUPPORTED = frozenset(
     )
     if code is not None
 )
-_SAFE_MOVE_SUPPORTED = (
+_SAFE_MOVE_SUPPORTED = _WINDOWS is not None or (
     _RENAMEAT2 is not None
     and bool(_O_DIRECTORY and _O_NOFOLLOW)
     and {os.open, os.stat, os.mkdir} <= os.supports_dir_fd
     and os.scandir in os.supports_fd
 )
 SAFE_MOVE_UNAVAILABLE = (
-    "Applying is not supported on this platform yet: it needs Linux, whose "
-    "renameat2 call moves a file in one step while refusing to replace anything"
+    "Applying is not supported on this platform yet: it needs Linux or Windows, "
+    "which can move a file in one step while refusing to replace anything"
 )
 
 
@@ -1011,10 +1438,9 @@ def _destination_taken(directory: Path | int, name: str) -> str | None:
     """Return why a destination name is taken, comparing names without case."""
     wanted = name.casefold()
     try:
-        with os.scandir(directory) as iterator:
-            for entry in iterator:
-                if entry.name.casefold() == wanted:
-                    return f"Destination already exists: {entry.name}"
+        for found in _list_names(directory):
+            if found.casefold() == wanted:
+                return f"Destination already exists: {found}"
     except FileNotFoundError:
         return "Destination folder disappeared after the check"
     except OSError as error:
@@ -1027,7 +1453,7 @@ def _open_failure(label: str, part: str, error: OSError, dir_fd: int) -> str:
         # Opening a link with O_NOFOLLOW reports ELOOP or, when the link leads
         # to a directory and O_DIRECTORY is set, ENOTDIR. Look to tell them apart.
         try:
-            metadata = os.stat(part, dir_fd=dir_fd, follow_symlinks=False)
+            metadata = _stat_at(dir_fd, part)
         except OSError:
             metadata = None
         if metadata is None or _is_link(metadata):
@@ -1047,18 +1473,18 @@ def _open_chain(
     try:
         for part in parts:
             try:
-                opened = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+                opened = _open_dir_at(current, part)
             except FileNotFoundError:
                 if not create:
                     return None, f"{label} folder is missing: {part}"
                 try:
-                    os.mkdir(part, dir_fd=current)
+                    _mkdir_at(current, part)
                 except FileExistsError:
                     pass  # Created by someone else just now; the open below checks it.
                 except OSError as error:
                     return None, f"Cannot create {part}: {error.strerror or error}"
                 try:
-                    opened = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+                    opened = _open_dir_at(current, part)
                 except OSError as error:
                     return None, _open_failure(label, part, error, current)
             except OSError as error:
@@ -1095,9 +1521,8 @@ def _digest_at(
     dir_fd: int, name: str, expected: os.stat_result, label: str
 ) -> tuple[str | None, str | None]:
     """Hash the file at name, which must still be the one already checked."""
-    flags = os.O_RDONLY | _O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(name, flags, dir_fd=dir_fd)
+        fd = _open_read_at(dir_fd, name)
     except OSError as error:
         return None, f"Cannot read {label} to check its contents: {error.strerror or error}"
     try:
@@ -1106,7 +1531,7 @@ def _digest_at(
             return None, f"{label} was replaced before its contents could be checked"
         if not stat.S_ISREG(before.st_mode):
             return None, f"{label} is no longer a regular file"
-        digest = _digest(fd)
+        digest = _digest(fd, before.st_size)
         after = os.fstat(fd)
         if (after.st_size, after.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
             return None, f"{label} changed while its contents were being checked"
@@ -1121,7 +1546,7 @@ def _stat_source(
     dir_fd: int, name: str, saved: dict
 ) -> tuple[os.stat_result | None, str | None]:
     try:
-        metadata = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        metadata = _stat_at(dir_fd, name)
     except FileNotFoundError:
         return None, "Source file is missing"
     except OSError as error:
@@ -1131,6 +1556,11 @@ def _stat_source(
 
 def _handle_path(fd: int) -> str | None:
     """Best effort: where does this open folder live now? None if unknown."""
+    if _WINDOWS is not None:
+        try:
+            return _WINDOWS.handle_path(fd)
+        except OSError:
+            return None
     try:
         return os.readlink(f"/proc/self/fd/{fd}")
     except OSError:
@@ -1152,7 +1582,7 @@ def _where_now(destination_fd: int, destination_parts: tuple[str, ...]) -> str:
             f"The file was moved and keeps the name {destination_parts[-1]}, but "
             "its folder is no longer where the plan says"
         )
-    return f"The file is now at {where}/{destination_parts[-1]}"
+    return f"The file is now at {os.path.join(where, destination_parts[-1])}"
 
 
 def _confirm_move(
@@ -1184,7 +1614,7 @@ def _confirm_move(
         )
 
     try:
-        os.stat(source_name, dir_fd=source_fd, follow_symlinks=False)
+        _stat_at(source_fd, source_name)
     except FileNotFoundError:
         pass
     except OSError as error:
@@ -1196,7 +1626,7 @@ def _confirm_move(
         )
 
     try:
-        landed = os.stat(destination_name, dir_fd=destination_fd, follow_symlinks=False)
+        landed = _stat_at(destination_fd, destination_name)
     except FileNotFoundError:
         return (
             f"The file was removed by something else right after the move: "
@@ -1229,7 +1659,7 @@ def _move_with_handles(
     stayed put.
     """
     try:
-        root_fd = os.open(root, _DIRECTORY_FLAGS)
+        root_fd = _open_root(root)
     except OSError as error:
         return f"Cannot open the selected folder: {error.strerror or error}"
     source_fd = destination_fd = None
@@ -1433,18 +1863,10 @@ def _open_journal(root_fd: int, root: Path) -> tuple[_Journal | None, str | None
         return None, reason
     try:
         base = _journal_name()
-        flags = (
-            os.O_WRONLY
-            | os.O_APPEND
-            | os.O_CREAT
-            | os.O_EXCL
-            | _O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
         for attempt in range(100):
             name = f"{base}.jsonl" if attempt == 0 else f"{base}-{attempt}.jsonl"
             try:
-                fd = os.open(name, flags, 0o600, dir_fd=directory_fd)
+                fd = _create_new_at(directory_fd, name)
             except FileExistsError:
                 continue
             except OSError as error:
@@ -1460,7 +1882,7 @@ def _start_journal(
     root: Path, header: dict
 ) -> tuple[_Journal | None, str | None]:
     try:
-        root_fd = os.open(root, _DIRECTORY_FLAGS)
+        root_fd = _open_root(root)
     except OSError as error:
         return None, f"Cannot open the selected folder: {error.strerror or error}"
     try:
@@ -1537,6 +1959,11 @@ def apply_plan(plan: dict, root: Path, plan_path: Path | None = None) -> dict:
                 "plan_schema_version": plan["schema_version"],
                 "options": plan["options"],
                 "planned": len(plan["entries"]),
+                # Files a choice leaves alone are planned but never moved, so
+                # a reader can tell them from files the run never reached.
+                "skipped": sum(
+                    1 for entry in report["entries"] if entry["status"] == "skipped"
+                ),
             },
         )
         if journal is None:
@@ -1690,7 +2117,7 @@ def _inspect_parts(
     try:
         for part in parts[:-1]:
             try:
-                opened = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+                opened = _open_dir_at(current, part)
             except FileNotFoundError:
                 return None, None  # A parent is gone, so the file is not here.
             except OSError as error:
@@ -1698,7 +2125,7 @@ def _inspect_parts(
             os.close(current)
             current = opened
         try:
-            return os.stat(parts[-1], dir_fd=current, follow_symlinks=False), None
+            return _stat_at(current, parts[-1]), None
         except FileNotFoundError:
             return None, None
         except OSError as error:
@@ -1763,7 +2190,11 @@ def load_record(path: Path) -> dict:
     if not isinstance(start.get("root"), str) or not start["root"]:
         reject("the start record has no root")
 
-    kind_expected = {"apply": "destination", "undo": "source"}.get(start.get("kind"))
+    # An apply always moves into the organised folder. An undo moves the other
+    # way from the run it undoes: out of the folder for an apply, back into it
+    # for an undo (a redo). Either way every file in one record moves the same
+    # way, and the first entry says which.
+    kind_expected = {"apply": "destination"}.get(start.get("kind"))
     entries: dict[int, dict] = {}
     order: list[int] = []
     for item in parsed[1:]:
@@ -1787,14 +2218,20 @@ def load_record(path: Path) -> dict:
                 reject(f"the source {item['source']} is not a safe path")
             if destination is None:
                 reject(f"the destination {item['destination']} is not a safe path")
-            # An apply record moves into the organised folder; an undo record
-            # moves back out of it. Either way exactly one end lives there, so
-            # a record can never describe a move between two ordinary names.
+            # Exactly one end of every move lives in the organised folder, so a
+            # record can never describe a move between two ordinary names.
             stored = _organised_side(source, destination)
             if stored is None:
                 reject(
                     f"neither {item['source']} nor {item['destination']} is a file "
                     f"inside {DESTINATION_NAME}"
+                )
+            if kind_expected is None and start.get("kind") == "undo":
+                kind_expected = stored
+            if start.get("kind") == "undo" and stored != kind_expected:
+                reject(
+                    "every file in an undo record must move the same way, but "
+                    f"{item['source']} does not"
                 )
             if kind_expected is not None and stored != kind_expected:
                 reject(
@@ -1825,14 +2262,41 @@ def load_record(path: Path) -> dict:
             entries[index]["outcome"] = item.get("outcome")
             entries[index]["finished"] = True
     end = next((item for item in parsed if item["record"] == "end"), None)
+
+    def typed(value: object, kind: type):
+        """Keep a described field only if it is the type it should be.
+
+        These fields are reported, never acted on, so a record that is odd in
+        one of them still reads back rather than being refused.
+        """
+        if kind is int and isinstance(value, bool):
+            return None  # True is an int, but never a count.
+        return value if isinstance(value, kind) else None
+
+    planned = typed(start.get("planned"), int)
+    if planned is not None and planned < 0:
+        planned = None
+    passed_over = typed(start.get("skipped"), int)
+    if passed_over is None or passed_over < 0:
+        passed_over = 0
     return {
         "path": str(path),
         "root": start["root"],
         "plan": start.get("plan"),
+        "kind": typed(start.get("kind"), str),
+        "started": typed(start.get("time"), str),
+        "planned": planned,
+        "passed_over": passed_over,
         "entries": [entries[index] for index in order],
         "finished": end is not None,
         "truncated": truncated,
         "complete": end is not None and not truncated,
+        "run_completed": typed(end.get("completed"), bool) if end else None,
+        "stopped_at": typed(end.get("stopped_at"), str) if end else None,
+        # An undo names the record it undid, which is how --show finds out
+        # that a run's files were put back rather than never moved.
+        "undoing": typed(start.get("undoing"), str),
+        "outcomes": typed(end.get("outcomes"), dict) if end else None,
     }
 
 
@@ -1846,7 +2310,7 @@ def _confirm_at_original(root: Path, entry: dict) -> str | None:
     if parts is None:
         return "The record uses a path that could leave the folder"
     try:
-        root_fd = os.open(root, _DIRECTORY_FLAGS)
+        root_fd = _open_root(root)
     except OSError as error:
         return f"Cannot open the selected folder: {error.strerror or error}"
     try:
@@ -1969,7 +2433,7 @@ def undo_record(record: dict, root: Path, record_path: Path | None = None) -> di
 
     entries = record["entries"]
     try:
-        root_fd = os.open(root_path, _DIRECTORY_FLAGS)
+        root_fd = _open_root(root_path)
     except OSError as error:
         raise FilePlanError(
             f"Cannot open the selected folder: {error.strerror or error}"
@@ -2027,6 +2491,9 @@ def undo_record(record: dict, root: Path, record_path: Path | None = None) -> di
                 "root": str(root_path),
                 "undoing": str(record_path) if record_path else record["path"],
                 "planned": len(entries),
+                # Entries already at their original name are passed over, so
+                # they never reach the record either.
+                "skipped": sum(1 for state, _ in states if state == "skip"),
             },
         )
         if journal is None:
@@ -2189,11 +2656,655 @@ def undo_record(record: dict, root: Path, record_path: Path | None = None) -> di
     }
 
 
+RUN_SCHEMA_VERSION = 1
+RUN_UNAVAILABLE = (
+    "Looking at a run needs the same folder handles as applying, so it needs "
+    "Linux or Windows"
+)
+
+
+def latest_record(root: Path) -> Path:
+    """Return the newest run record in a folder; raise if there is none."""
+    root_path = Path(os.path.abspath(Path(root).expanduser()))
+    folder = root_path / DESTINATION_NAME / JOURNAL_DIRECTORY
+    try:
+        names = [name for name in _list_names(folder) if name.endswith(".jsonl")]
+    except FileNotFoundError:
+        names = []
+    except OSError as error:
+        raise FilePlanError(
+            f"Cannot look for run records in {folder}: {error.strerror or error}"
+        ) from error
+    if not names:
+        raise FilePlanError(
+            f"No run records in {folder}, so there is no run to look at"
+        )
+    # A record is named for the time its run started, so the last name sorts
+    # newest. Ties within the same microsecond keep the higher process id.
+    return folder / max(names)
+
+
+_PUT_BACK = frozenset({"restored", "restored-unconfirmed"})
+# What a recorded outcome says about whether the file left its original name.
+# "unknown" is in neither: the run could not tell, and nothing here may decide
+# for it. These come from the record alone and never change with what is on
+# disk afterwards.
+_RECORD_SAYS_MOVED = frozenset(
+    {"moved", "moved-unconfirmed", "restored", "restored-unconfirmed"}
+)
+_RECORD_SAYS_STAYED = frozenset({"not-moved", "not-restored"})
+
+
+def _later_runs(record_name: str, root: Path) -> list[dict]:
+    """Find every undo that follows from a record, at any depth, oldest first.
+
+    An undo of the record puts its files back; an undo of that undo (a redo)
+    moves them back in again; an undo of the redo puts them back again, and so
+    on. Each result names its record, the record it undid, its depth in that
+    chain, which way it moved files, how it ended, and the outcome it recorded
+    for each of this run's files, keyed by the name the file had in the record
+    it undid. A file a run was moving when it was cut off is "no-outcome".
+
+    Everything here is read from records, never from where files are now, and
+    each record is fixed once its run ends. So a later undo or redo can add to
+    what is reported, but nothing it does can change what an earlier run is
+    credited with. A record that cannot be read is passed over.
+    """
+    folder = root / DESTINATION_NAME / JOURNAL_DIRECTORY
+    try:
+        names = sorted(name for name in _list_names(folder) if name.endswith(".jsonl"))
+    except OSError:
+        return []
+    children: dict[str, list[tuple[str, dict]]] = {}
+    for name in names:
+        try:
+            other = load_record(folder / name)
+        except FilePlanError:
+            continue
+        if other["kind"] != "undo" or not other["undoing"]:
+            continue
+        # Records are named uniquely and live in the one folder, so the name
+        # identifies the record even if the undo was given a relative path.
+        parent = os.path.normcase(Path(other["undoing"]).name)
+        children.setdefault(parent, []).append((name, other))
+
+    found = []
+    seen = {os.path.normcase(record_name)}
+    pending = [(record_name, 1)]
+    while pending:
+        parent_name, depth = pending.pop()
+        for name, other in children.get(os.path.normcase(parent_name), ()):
+            if os.path.normcase(name) in seen:
+                continue
+            seen.add(os.path.normcase(name))
+            outcomes: dict[str, str] = {}
+            for entry in other["entries"]:
+                # An undo moves each file from where the record it undid left
+                # it back to where that record found it.
+                outcomes[entry["destination"]] = (
+                    entry["outcome"] if isinstance(entry["outcome"], str) else "no-outcome"
+                )
+            for source, outcome in (other["outcomes"] or {}).items():
+                if isinstance(source, str) and isinstance(outcome, str):
+                    outcomes.setdefault(source, outcome)
+            found.append(
+                {
+                    "record": str(folder / name),
+                    "undoing": str(folder / parent_name),
+                    "depth": depth,
+                    # Odd depths reverse the run being shown; even depths
+                    # repeat it. This is what matching files up relies on.
+                    "reverses": bool(depth % 2),
+                    # Which way this run physically moved files, read from its
+                    # own entries: "in" to the organised folder or "out" of it.
+                    # None only for a run that names no files; filled in below.
+                    "direction": _moves(other["entries"]),
+                    "outcomes": outcomes,
+                    "record_complete": other["complete"],
+                    "truncated": other["truncated"],
+                    "completed": bool(other["complete"] and other["run_completed"]),
+                    "stopped_at": other["stopped_at"],
+                }
+            )
+            pending.append((name, depth + 1))
+    found.sort(key=lambda run: Path(run["record"]).name)
+    return found
+
+
+def _moves(entries: list[dict]) -> str | None:
+    """Which way a record physically moved its files, read from its entries.
+
+    "in" means into the organised folder, "out" means out of it. Every entry
+    in one record moves the same way, which reading the record checks.
+    """
+    for entry in entries:
+        source = _relative_parts(entry["source"])
+        destination = _relative_parts(entry["destination"])
+        if source is None or destination is None:
+            continue
+        side = _organised_side(source, destination)
+        if side == "destination":
+            return "in"
+        if side == "source":
+            return "out"
+    return None
+
+
+def _flip(direction: str | None) -> str | None:
+    return {"in": "out", "out": "in"}.get(direction)
+
+
+def _outcome_for(run: dict, entry: dict) -> str | None:
+    """What a later run recorded for one of this run's files.
+
+    A run that reverses this one keys each file by where this run found it; a
+    run that repeats this one keys it by where this run left it. That holds
+    whichever way this run moved files, so it depends only on the relationship.
+    """
+    key = entry["source"] if run["reverses"] else entry["destination"]
+    return run["outcomes"].get(key)
+
+
+def inspect_run(record: dict, root: Path, record_path: Path | None = None) -> dict:
+    """Say what a run record describes and where each of its files is now.
+
+    Nothing is moved, created, or written. Every entry is looked at on disk
+    with the same checks an undo would make, so the report also says what an
+    undo would be able to do. A run that was cut off leaves an entry with no
+    outcome, which is the file that was in flight when it stopped.
+    """
+    if not _SAFE_MOVE_SUPPORTED:
+        raise FilePlanError(RUN_UNAVAILABLE)
+    root_path = Path(os.path.abspath(Path(root).expanduser()))
+    try:
+        root_path = root_path.resolve(strict=True)
+    except OSError as error:
+        raise FilePlanError(
+            f"Cannot resolve {root_path}: {error.strerror or error}"
+        ) from error
+    if os.path.normcase(str(root_path)) != os.path.normcase(record["root"]):
+        raise FilePlanError(
+            f"The record was made for {record['root']}, not {root_path}"
+        )
+
+    entries = record["entries"]
+    try:
+        root_fd = _open_root(root_path)
+    except OSError as error:
+        raise FilePlanError(
+            f"Cannot open the selected folder: {error.strerror or error}"
+        ) from error
+    try:
+        states = [_restore_state(root_fd, entry, root_path) for entry in entries]
+    finally:
+        os.close(root_fd)
+
+    # A record names the two ends of each move, and one of them is always
+    # inside the organised folder. Saying which end holds the file now works
+    # the same way for a run that applied a plan and one that undid it.
+    where = {"restore": "destination", "skip": "source", "blocked": "unclear"}
+    shown = str(record_path) if record_path is not None else record["path"]
+    later = _later_runs(Path(shown).name, root_path)
+    # Which way the shown run moved its files. An apply always moves them in;
+    # an undo moves them whichever way its entries say.
+    moves = _moves(entries) or ("in" if record["kind"] == "apply" else None)
+    for run in later:
+        if run["direction"] is None:
+            run["direction"] = _flip(moves) if run["reverses"] else moves
+    results = []
+    outcomes: dict[str, int] = {}
+    counts = {"destination": 0, "source": 0, "unclear": 0}
+    # "said" is the record's own account of whether each file moved; it is
+    # fixed the moment the run ends.
+    said = {"moved": 0, "unconfirmed": 0, "stayed": 0, "unknown": 0, "no-outcome": 0}
+    # Read from the later runs' records alone, like "said": each is fixed
+    # once its run ends, so any number of undos and redos can add to these
+    # but none can change what an earlier one is credited with.
+    put_back_by_any = 0
+    moved_again_by_any = 0
+    # The one count here that comes from the disk: files the record says
+    # moved, found at their original name, with no later run to account for it.
+    back_unexplained = 0
+    for entry, (state, reason) in zip(entries, states):
+        counts[where[state]] += 1
+        outcomes[entry["outcome"] or "no-outcome"] = (
+            outcomes.get(entry["outcome"] or "no-outcome", 0) + 1
+        )
+        # The latest later run that tried this file, and the latest one that
+        # confirmed moving it, in whichever direction.
+        tried = confirmed = None
+        tried_outcome = None
+        for run in later:
+            outcome = _outcome_for(run, entry)
+            # "skipped" means that run found the file already where it would
+            # have put it, so it tried nothing; an earlier run's word stands.
+            if outcome not in (None, "not-attempted", "skipped"):
+                tried, tried_outcome = run, outcome
+            if outcome == "restored":
+                confirmed = run
+        if any(r["reverses"] and _outcome_for(r, entry) == "restored" for r in later):
+            put_back_by_any += 1
+        if any(not r["reverses"] and _outcome_for(r, entry) == "restored" for r in later):
+            moved_again_by_any += 1
+        # Credited with where the file is only when its record confirms the
+        # move and the file is found there now.
+        undone_by = (
+            confirmed["record"]
+            if confirmed and confirmed["reverses"] and where[state] == "source"
+            else None
+        )
+        redone_by = (
+            confirmed["record"]
+            if confirmed and not confirmed["reverses"] and where[state] == "destination"
+            else None
+        )
+        recorded = entry["outcome"]
+        if recorded is None:
+            said["no-outcome"] += 1
+        elif recorded in _RECORD_SAYS_MOVED:
+            said["moved"] += 1
+            if recorded not in ("moved", "restored"):
+                # It left its name, but the look afterwards found a problem.
+                said["unconfirmed"] += 1
+        elif recorded in _RECORD_SAYS_STAYED:
+            said["stayed"] += 1
+        else:
+            said["unknown"] += 1
+        if (
+            where[state] == "source"
+            and recorded in _RECORD_SAYS_MOVED
+            and not undone_by
+            and not (tried and tried["reverses"])
+        ):
+            back_unexplained += 1
+        undo_record = tried["record"] if tried else None
+        undo_outcome = tried_outcome
+        undo_direction = tried["direction"] if tried else None
+        undo_reverses = tried["reverses"] if tried else None
+        undo_depth = tried["depth"] if tried else None
+        results.append(
+            {
+                "source": entry["source"],
+                "destination": entry["destination"],
+                "recorded": entry["outcome"],
+                "finished": entry["finished"],
+                "undone_by": undone_by,
+                "undo_record": undo_record,
+                "undo_outcome": undo_outcome,
+                "undo_direction": undo_direction,
+                "undo_reverses": undo_reverses,
+                "undo_depth": undo_depth,
+                "redone_by": redone_by,
+                "where": where[state],
+                "undo": {
+                    "restore": "would-move",
+                    "skip": "nothing-to-do",
+                    "blocked": "blocked",
+                }[state],
+                "reason": reason if state == "blocked" else None,
+            }
+        )
+    unfinished = [item["source"] for item in results if not item["finished"]]
+    planned = record["planned"]
+    passed_over = record["passed_over"]
+    never_started = (
+        max(planned - passed_over - len(entries), 0) if planned is not None else None
+    )
+    return {
+        "schema_version": RUN_SCHEMA_VERSION,
+        "kind": "run",
+        "record": shown,
+        "run": record["kind"],
+        # Which way the shown run moved files: "in" to the organised folder or
+        # "out" of it. Every direction in this report is physical like this.
+        "moves": moves,
+        "undoing": record["undoing"],
+        # Every undo that follows from this run, at any depth, oldest first.
+        # Each count comes from that run's own record and never changes.
+        "undo_runs": [
+            {
+                "record": run["record"],
+                "undoing": run["undoing"],
+                "depth": run["depth"],
+                "reverses": run["reverses"],
+                "direction": run["direction"],
+                "completed": run["completed"],
+                "record_complete": run["record_complete"],
+                "truncated": run["truncated"],
+                "stopped_at": run["stopped_at"],
+                # Only moves its record confirms. Moves it made but could not
+                # confirm, and the move it was making when cut off, are
+                # counted apart, so nothing is credited that was not confirmed.
+                "files": sum(
+                    1 for entry in entries if _outcome_for(run, entry) == "restored"
+                ),
+                "unconfirmed": sum(
+                    1
+                    for entry in entries
+                    if _outcome_for(run, entry) == "restored-unconfirmed"
+                ),
+                "no_outcome": sum(
+                    1 for entry in entries if _outcome_for(run, entry) == "no-outcome"
+                ),
+            }
+            for run in later
+        ],
+        "root": str(root_path),
+        "plan": record["plan"],
+        "started": record["started"],
+        "entries": results,
+        # The last entry with no outcome is the file that was in flight when a
+        # cut-off run stopped. In a finished record it means the run could not
+        # write down what happened, which is just as unsettled.
+        "cut_off_at": unfinished[-1] if unfinished and not record["complete"] else None,
+        "outcomes": outcomes,
+        "summary": {
+            "entries": len(entries),
+            "planned": planned,
+            "passed_over": passed_over,
+            "never_started": never_started,
+            "no_outcome": len(unfinished),
+            # From the record alone; these do not move when the files do.
+            "recorded_moved": said["moved"],
+            # Of those, the ones moved without the move being confirmed.
+            "recorded_moved_unconfirmed": said["unconfirmed"],
+            "recorded_not_moved": said["stayed"],
+            "recorded_unknown": said["unknown"],
+            # What has become of those files since the run ended.
+            "put_back": put_back_by_any,
+            "moved_again": moved_again_by_any,
+            "back_without_undo": back_unexplained,
+            "at_destination": counts["destination"],
+            "at_source": counts["source"],
+            "unclear": counts["unclear"],
+            "record_complete": record["complete"],
+            "truncated": record["truncated"],
+            "run_completed": record["run_completed"],
+            "stopped_at": record["stopped_at"],
+            "undo_possible": counts["unclear"] == 0,
+        },
+    }
+
+
+# Every direction shown is physical: "in" is into the organised folder and
+# "out" is out of it, read from each run's own entries. Whether a run reversed
+# or repeated the one being shown is kept apart and never decides the words.
+_MOVE = {"in": "into the organised folder", "out": "out of the organised folder"}
+_PLACE = {"in": "in the organised folder", "out": "outside the organised folder"}
+
+
+def _fell_short(direction: str | None, outcome: str | None) -> str | None:
+    """What a later run that tried a file, but did not settle it, is said to have done."""
+    where = f" {_MOVE[direction]}" if direction in _MOVE else ""
+    return {
+        "no-outcome": f"was cut off while moving it{where}",
+        "not-restored": f"did not move it{where}",
+        "unknown": f"could not tell whether it moved it{where}",
+        # Its record says the move happened but the look afterwards failed,
+        # so say what it recorded rather than that the move worked.
+        "restored-unconfirmed": f"recorded moving it{where} but could not confirm it",
+        "restored": f"moved it{where}, but it has been moved here again since",
+    }.get(outcome)
+
+
+def _how_it_stopped(run: dict) -> str:
+    """Say why a run that did not finish did not; never called for one that did."""
+    if run["truncated"] or not run["record_complete"]:
+        # A kill and a failed final write look the same here: no closing entry.
+        return "its record was never closed"
+    if run["stopped_at"]:
+        return f"stopped early at {_quote(run['stopped_at'])}"
+    return "stopped early"
+
+
+def _later_run_line(run: dict, entries: int) -> str:
+    """Say how one later undo of this run ended, and what its record credits it with.
+
+    The count comes from that run's own record, so it reads the same however
+    many undos and redos follow, and the direction comes from that run's own
+    entries. Only a run whose record says it completed is called finished.
+    """
+    name = _quote(Path(run["record"]).name)
+    undid = _quote(Path(run["undoing"]).name)
+    where = f" {_MOVE[run['direction']]}" if run["direction"] in _MOVE else ""
+    did = (
+        f"its record confirms it moved {run['files']} of this run's {entries} "
+        f"files{where}"
+    )
+    if run["unconfirmed"]:
+        did += f", and {run['unconfirmed']} more it could not confirm"
+    if run["no_outcome"]:
+        did += (
+            f", and it was moving {run['no_outcome']} more when it stopped, "
+            "with no outcome written"
+        )
+    if run["completed"]:
+        if run["depth"] == 1:
+            return f"Undone since by {name}, which finished; {did}."
+        return f"{undid} was itself undone by {name}, which finished; {did}."
+    what = "An undo" if run["depth"] == 1 else f"An undo of {undid}"
+    return (
+        f"{what} was started in {name} but {_how_it_stopped(run)}, so it did "
+        f"not finish; {did}."
+    )
+
+
+def _where_note(item: dict, source: str) -> str:
+    """Say where a file is now and which later run, if any, accounts for it.
+
+    Never contradicts the record: a file is only said not to have moved when
+    the record says so, and a file with no recorded outcome is never said to
+    have stayed put. Directions are physical, from the later run's own entries.
+    """
+    name = _quote(Path(item["undo_record"]).name) if item["undo_record"] else None
+    direction = item["undo_direction"]
+    outcome = item["undo_outcome"]
+    note = _fell_short(direction, outcome) if name else None
+    if item["where"] == "destination":
+        if item["redone_by"]:
+            redo = _quote(Path(item["redone_by"]).name)
+            return f"the file is there now; the undo in {redo} moved it here again"
+        if note and not (item["undo_reverses"] is False and outcome == "restored"):
+            return f"the file is there now; the undo in {name} {note}"
+        return "the file is there now"
+    if item["where"] == "source":
+        if item["undone_by"]:
+            undo = _quote(Path(item["undone_by"]).name)
+            return f"put back at {source} by the undo in {undo}"
+        if note and outcome == "no-outcome":
+            return (
+                f"the file is at {source}; the undo in {name} {note}, so that "
+                "undo never confirmed it"
+            )
+        if note:
+            return f"the file is at {source}; the undo in {name} {note}"
+        if item["recorded"] in _RECORD_SAYS_MOVED:
+            # The record says it moved, so never claim it did not.
+            return (
+                f"the file is back at {source}; this run moved it, but no "
+                "undo record says it was put back"
+            )
+        if item["recorded"] in _RECORD_SAYS_STAYED:
+            return f"the file is still at {source}; the record says it did not move"
+        if item["recorded"]:
+            # An unknown outcome stays unknown.
+            return (
+                f"the file is at {source}; this run could not tell whether it "
+                "moved, and nothing since says either"
+            )
+        # No outcome was ever written for this file. Finding it at its
+        # original name now does not show it never moved: it may have moved
+        # and been put back by something with no record. Say only what is known.
+        return (
+            f"the file is at {source} now; the record has no outcome for it, "
+            "so whether it moved is not known"
+        )
+    reason = f"in doubt: {_quote(item['reason'])}"
+    if note:
+        reason += f"; the undo in {name} {note}"
+    return reason
+
+
+def _were(count: int) -> str:
+    return "was" if count == 1 else "were"
+
+
+def _record_account(summary: dict, moves: str | None = None) -> str:
+    """State what the record says became of its files, then what has happened
+    since. The first half is read from the record only, so it reads the same
+    whether or not the run has since been undone."""
+    entries = summary["entries"]
+    confirmed = summary["recorded_moved"] - summary["recorded_moved_unconfirmed"]
+    said = f"The record confirms {confirmed} of its {entries} files moved"
+    rest = []
+    if summary["recorded_moved_unconfirmed"]:
+        count = summary["recorded_moved_unconfirmed"]
+        rest.append(f"{count} moved but could not be confirmed")
+    if summary["recorded_not_moved"]:
+        rest.append(f"{summary['recorded_not_moved']} did not")
+    if summary["recorded_unknown"]:
+        rest.append(
+            f"{summary['recorded_unknown']} could not be told either way"
+        )
+    if summary["no_outcome"]:
+        count = summary["no_outcome"]
+        rest.append(f"{count} {_were(count)} left with no outcome")
+    if rest:
+        said += ", " + ", ".join(rest[:-1] + [f"and {rest[-1]}"])
+    since = []
+    if summary["put_back"]:
+        count = summary["put_back"]
+        back = _MOVE.get(_flip(moves))
+        since.append(
+            f"{count} {_were(count)} moved back" + (f" {back}" if back else "")
+        )
+    if summary["moved_again"]:
+        count = summary["moved_again"]
+        again = _MOVE.get(moves)
+        since.append(
+            f"{count} {_were(count)} moved" + (f" {again}" if again else "")
+            + " again by undoing an undo"
+        )
+    if summary["back_without_undo"]:
+        count = summary["back_without_undo"]
+        since.append(
+            f"{count} {'is' if count == 1 else 'are'} back with no undo record "
+            "to say why"
+        )
+    if not since:
+        return said + "."
+    # Every "since" count below comes from undo records confirming the move,
+    # except files found back with no undo record, which come from the disk.
+    confirmed_since = [part for part in since if "no undo record" not in part]
+    if confirmed_since:
+        since[0] = "undo records confirm " + since[0]
+    if len(since) > 1:
+        since = since[:-1] + [f"and {since[-1]}"]
+    return said + "; since then " + (", " if len(since) > 2 else " ").join(since) + "."
+
+
+def _plain_run_output(report: dict) -> str:
+    summary = report["summary"]
+    if report["run"] == "undo" and report["undoing"]:
+        kind = f"undoing {_quote(Path(report['undoing']).name)}"
+    else:
+        kind = {"apply": "applying a plan", "undo": "undoing a run"}.get(
+            report["run"], "a run"
+        )
+    lines = [
+        f"Run record {_quote(report['record'])}",
+        f"From {kind} in {_quote(report['root'])}"
+        + (f", started {report['started']}" if report["started"] else ""),
+    ]
+    if report["moves"] in _MOVE:
+        # Which way this run set out to move files, since an undo can go
+        # either way. What it confirms is said below, file by file.
+        lines.append(f"It set out to move files {_MOVE[report['moves']]}.")
+    if report["plan"]:
+        lines.append(f"Plan: {_quote(report['plan'])}")
+    if summary["truncated"]:
+        lines.append(
+            "The run was cut off: the record ends with an unfinished line, so "
+            "it may be missing its last entry."
+        )
+    elif not summary["record_complete"]:
+        lines.append(
+            "The run was cut off: the record has no closing entry, so it never "
+            "reached the end."
+        )
+    elif summary["run_completed"]:
+        lines.append("The run finished and the record is complete.")
+    else:
+        stopped = summary["stopped_at"]
+        lines.append(
+            "The run stopped early"
+            + (f" at {_quote(stopped)}" if stopped else "")
+            + ", and the record is complete."
+        )
+    if summary["planned"] is not None:
+        covered = (
+            f"Planned {summary['planned']} files; the record covers "
+            f"{summary['entries']}."
+        )
+        if summary["passed_over"]:
+            aside = summary["passed_over"]
+            covered += (
+                f" {aside} {'was' if aside == 1 else 'were'} left alone on purpose."
+            )
+        if summary["never_started"]:
+            started = summary["never_started"]
+            covered += (
+                f" {started} {'file was' if started == 1 else 'files were'} "
+                "never started."
+            )
+        lines.append(covered)
+    if report["entries"]:
+        lines.append(_record_account(summary, report["moves"]))
+    for item in report["entries"]:
+        # JSON quoting keeps newlines and other filename controls on one line.
+        source = _quote(item["source"])
+        destination = _quote(item["destination"])
+        label = item["recorded"] or "no outcome"
+        line = f"[{label}] {source} -> {destination} ({_where_note(item, source)})"
+        lines.append(line)
+    if report["cut_off_at"]:
+        lines.append(
+            f"In flight when it stopped: {_quote(report['cut_off_at'])}."
+            " The line above says where that file is now."
+        )
+    for run in report["undo_runs"]:
+        lines.append(_later_run_line(run, summary["entries"]))
+    if not report["entries"]:
+        lines.append("The record names no files, so nothing was moved.")
+    elif report["undo_runs"] and not summary["at_destination"] and not summary["unclear"]:
+        lines.append(
+            "Nothing is left to undo: every file is back where this run found it"
+            + (f", {_PLACE[_flip(report['moves'])]}." if report["moves"] else ".")
+        )
+    elif summary["unclear"]:
+        lines.append(
+            f"{summary['unclear']} of {summary['entries']} entries are in doubt, "
+            "so --undo would be refused until they are settled."
+        )
+    else:
+        lines.append(
+            f"--undo on this record would move {summary['at_destination']} "
+            f"file{'' if summary['at_destination'] == 1 else 's'}"
+            + (
+                f" and leave {summary['at_source']} alone."
+                if summary["at_source"]
+                else "."
+            )
+        )
+    lines.append("Look only. No files were changed.")
+    return "\n".join(lines) + "\n"
+
+
 def _plain_undo_output(report: dict) -> str:
     summary = report["summary"]
     lines = [
-        f"Undoing {json.dumps(report['undoing'], ensure_ascii=False)} in "
-        f"{json.dumps(report['root'], ensure_ascii=False)}"
+        f"Undoing {_quote(report['undoing'])} in "
+        f"{_quote(report['root'])}"
     ]
     if report["truncated"]:
         lines.append(
@@ -2206,7 +3317,7 @@ def _plain_undo_output(report: dict) -> str:
             "describes was cut off."
         )
     if report["record"]["path"]:
-        lines.append(f"Record: {json.dumps(report['record']['path'], ensure_ascii=False)}")
+        lines.append(f"Record: {_quote(report['record']['path'])}")
     if report["record"]["warning"]:
         lines.append(f"Record incomplete: {report['record']['warning']}")
     if not summary["applied"]:
@@ -2225,12 +3336,12 @@ def _plain_undo_output(report: dict) -> str:
     }
     for item in report["results"]:
         # JSON quoting keeps newlines and other filename controls on one line.
-        stored = json.dumps(item["destination"], ensure_ascii=False)
+        stored = _quote(item["destination"])
         line = f"[{labels[item['outcome']]}] {stored}"
         if item["outcome"] in ("restored", "restored-unconfirmed"):
-            line += f" -> {json.dumps(item['source'], ensure_ascii=False)}"
+            line += f" -> {_quote(item['source'])}"
         if item["reason"] and item["outcome"] != "not-attempted":
-            line += f" ({json.dumps(item['reason'], ensure_ascii=False)})"
+            line += f" ({_quote(item['reason'])})"
         lines.append(line)
     if not summary["applied"]:
         lines.append("Nothing was moved. Look at the blocked entries above.")
@@ -2245,6 +3356,15 @@ def _plain_undo_output(report: dict) -> str:
             )
         )
         return "\n".join(lines) + "\n"
+    if report["stopped"] is None:
+        # Every file was dealt with, but the undo's own record never closed,
+        # so it is not reported as finished.
+        lines.append(
+            f"Put back {summary['restored']} of {summary['entries']} files, but "
+            "the record of this undo is not finished, so the undo is not "
+            "complete and that record cannot be relied on to reverse it."
+        )
+        return "\n".join(lines) + "\n"
     counted = [f"{summary['restored_confirmed']} put back"]
     if summary["restored_unconfirmed"]:
         counted.append(f"{summary['restored_unconfirmed']} put back but unconfirmed")
@@ -2256,7 +3376,7 @@ def _plain_undo_output(report: dict) -> str:
     if summary["not_attempted"]:
         counted.append(f"{summary['not_attempted']} not attempted")
     where = (
-        json.dumps(report["stopped"]["destination"], ensure_ascii=False)
+        _quote(report["stopped"]["destination"])
         if report["stopped"]
         else "the end"
     )
@@ -2271,12 +3391,12 @@ def _plain_undo_output(report: dict) -> str:
 def _plain_output(plan: dict) -> str:
     summary = plan["summary"]
     lines = [
-        f"Preview for {json.dumps(plan['root'], ensure_ascii=False)}",
+        f"Preview for {_quote(plan['root'])}",
         f"{summary['files']} files: {summary['ready']} ready, "
         f"{summary['conflicts']} conflicts, "
         + (f"{summary['skipped']} skipped by choice, " if summary.get("skipped") else "")
         + f"{summary['total_bytes']} bytes",
-        f"Destination: {json.dumps(plan['destination_root'], ensure_ascii=False)}",
+        f"Destination: {_quote(plan['destination_root'])}",
     ]
     if plan["options"].get("check_duplicates"):
         lines.append("Duplicate check: contents of files that would share a name were compared")
@@ -2286,7 +3406,7 @@ def _plain_output(plan: dict) -> str:
         unmatched = (
             "go by extension"
             if fallback == "by-extension"
-            else f"go to {json.dumps(fallback['folder'], ensure_ascii=False)}"
+            else f"go to {_quote(fallback['folder'])}"
         )
         count = len(rules["rules"])
         lines.append(
@@ -2294,22 +3414,22 @@ def _plain_output(plan: dict) -> str:
         )
     for entry in plan["entries"]:
         # JSON quoting keeps newlines and other filename controls on one line.
-        source = json.dumps(entry["source"], ensure_ascii=False)
-        destination = json.dumps(entry["destination"], ensure_ascii=False)
+        source = _quote(entry["source"])
+        destination = _quote(entry["destination"])
         line = f"[{entry['status']}] {source} -> {destination}"
         if entry.get("rule"):
-            line += f" by rule {json.dumps(entry['rule'], ensure_ascii=False)}"
+            line += f" by rule {_quote(entry['rule'])}"
         if entry.get("choice") == "rename" and entry.get("renamed_from"):
-            line += f", renamed by choice from {json.dumps(entry['renamed_from'], ensure_ascii=False)}"
+            line += f", renamed by choice from {_quote(entry['renamed_from'])}"
         elif entry.get("choice") == "keep":
             line += ", kept by choice"
         if entry["reason"]:
-            line += f" ({json.dumps(entry['reason'], ensure_ascii=False)})"
+            line += f" ({_quote(entry['reason'])})"
         lines.append(line)
     if plan["skipped"]:
         lines.append(f"Skipped {len(plan['skipped'])} entries:")
         for entry in plan["skipped"]:
-            path = json.dumps(entry["path"], ensure_ascii=False)
+            path = _quote(entry["path"])
             lines.append(f"  {path}: {entry['reason']}")
     lines.append("Preview only. No files were changed.")
     return "\n".join(lines) + "\n"
@@ -2319,8 +3439,8 @@ def _plain_verification_output(report: dict) -> str:
     summary = report["summary"]
     source = report["plan"] or "the saved plan"
     lines = [
-        f"Verification of {json.dumps(source, ensure_ascii=False)} against "
-        f"{json.dumps(report['root'], ensure_ascii=False)}",
+        f"Verification of {_quote(source)} against "
+        f"{_quote(report['root'])}",
         f"{summary['entries']} entries: {summary['unchanged']} unchanged, "
         f"{summary['changed']} changed, {summary['missing']} missing, "
         f"{summary['conflicts']} conflicts, {summary['new']} new"
@@ -2328,13 +3448,13 @@ def _plain_verification_output(report: dict) -> str:
     ]
     for entry in report["entries"]:
         # JSON quoting keeps newlines and other filename controls on one line.
-        path = json.dumps(entry["source"], ensure_ascii=False)
+        path = _quote(entry["source"])
         line = f"[{entry['status']}] {path}"
         effective = entry.get("effective_destination")
         if effective and effective != entry["destination"]:
-            line += f" -> {json.dumps(effective, ensure_ascii=False)}"
+            line += f" -> {_quote(effective)}"
         if entry["reason"]:
-            line += f" ({json.dumps(entry['reason'], ensure_ascii=False)})"
+            line += f" ({_quote(entry['reason'])})"
         lines.append(line)
     if summary["problems"]:
         lines.append(f"{summary['problems']} entries need review before any move.")
@@ -2346,10 +3466,14 @@ def _plain_verification_output(report: dict) -> str:
 
 def _plain_application_output(report: dict) -> str:
     summary = report["summary"]
-    source = report["plan"] or "the saved plan"
+    # A plan settled in the terminal was never saved, so it has no path.
+    source = (
+        _quote(report["plan"])
+        if report["plan"]
+        else "the plan just settled here"
+    )
     lines = [
-        f"Applying {json.dumps(source, ensure_ascii=False)} to "
-        f"{json.dumps(report['root'], ensure_ascii=False)}"
+        f"Applying {source} to {_quote(report['root'])}"
     ]
     if not summary["applied"]:
         lines.append(
@@ -2359,17 +3483,17 @@ def _plain_application_output(report: dict) -> str:
         for entry in report["verification"]["entries"]:
             if entry["status"] != "unchanged":
                 # JSON quoting keeps newlines and other filename controls on one line.
-                path = json.dumps(entry["source"], ensure_ascii=False)
-                reason = json.dumps(entry["reason"], ensure_ascii=False)
+                path = _quote(entry["source"])
+                reason = _quote(entry["reason"])
                 lines.append(f"  [{entry['status']}] {path} ({reason})")
         lines.append("Nothing was moved. Make a new plan once these are settled.")
         return "\n".join(lines) + "\n"
     if report["record"]["path"]:
-        lines.append(f"Record: {json.dumps(report['record']['path'], ensure_ascii=False)}")
+        lines.append(f"Record: {_quote(report['record']['path'])}")
     if report["record"]["warning"]:
         lines.append(f"Record incomplete: {report['record']['warning']}")
     if report["stopped"] and report["stopped"]["outcome"] == "not-attempted":
-        reason = json.dumps(report["stopped"]["reason"], ensure_ascii=False)
+        reason = _quote(report["stopped"]["reason"])
         lines.append(f"Stopped before any move: {reason}")
     labels = {
         "moved": "moved",
@@ -2381,12 +3505,12 @@ def _plain_application_output(report: dict) -> str:
     }
     for entry in report["results"]:
         # JSON quoting keeps newlines and other filename controls on one line.
-        path = json.dumps(entry["source"], ensure_ascii=False)
+        path = _quote(entry["source"])
         line = f"[{labels[entry['outcome']]}] {path}"
         if entry["outcome"] in ("moved", "moved-unconfirmed"):
-            line += f" -> {json.dumps(entry['destination'], ensure_ascii=False)}"
+            line += f" -> {_quote(entry['destination'])}"
         if entry["reason"] and entry["outcome"] != "not-attempted":
-            line += f" ({json.dumps(entry['reason'], ensure_ascii=False)})"
+            line += f" ({_quote(entry['reason'])})"
         lines.append(line)
     if summary["completed"]:
         lines.append(
@@ -2411,7 +3535,7 @@ def _plain_application_output(report: dict) -> str:
         counted.append(f"{summary['skipped']} skipped by choice")
     if summary["not_attempted"]:
         counted.append(f"{summary['not_attempted']} not attempted")
-    stopped_at = json.dumps(report["stopped"]["source"], ensure_ascii=False)
+    stopped_at = _quote(report["stopped"]["source"])
     noun = "file" if summary["planned"] == 1 else "files"
     lines.append(
         f"Stopped at {stopped_at}. Of {summary['planned']} {noun}: "
@@ -2426,11 +3550,321 @@ def _plain_application_output(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Characters never printed as they are: control characters, line and
+# paragraph separators, lone surrogates (bytes in a filename that were not
+# valid text), and bidirectional controls that could make one name read as
+# another. Joiners and variation selectors, which emoji are built from, are
+# printed as they are.
+_BIDI_CONTROLS = frozenset(
+    "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+)
+_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _unsafe(character: str) -> bool:
+    return (
+        unicodedata.category(character) in ("Cc", "Cs", "Zl", "Zp")
+        or character in _BIDI_CONTROLS
+    )
+
+
+def _quote(text: str) -> str:
+    """Quote a name or path for the terminal so it can be copied back in.
+
+    Almost every name is printed exactly as it is between double quotes, emoji
+    and Windows backslashes included, so a path in the output can be pasted
+    straight into the next command. Only a name holding something that cannot
+    be shown safely is written with backslash escapes instead: a control
+    character such as a newline, a bidirectional control, or bytes that were
+    not valid text. So is a name containing a double quote, or, outside
+    Windows, a backslash, since either would make the escapes ambiguous.
+    Windows forbids both in names, so there a backslash is only ever a
+    separator. Seeing a backslash escape therefore always means the name was
+    escaped, and an escaped name reads exactly like JSON.
+    """
+    plain = (
+        '"' not in text
+        and (os.sep == "\\" or "\\" not in text)
+        and not any(_unsafe(character) for character in text)
+    )
+    if plain:
+        return f'"{text}"'
+    escaped = []
+    for character in text:
+        if character in _ESCAPES:
+            escaped.append(_ESCAPES[character])
+        elif _unsafe(character):
+            code = ord(character)
+            escaped.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
+        else:
+            escaped.append(character)
+    return '"' + "".join(escaped) + '"'
+
+
+def _speak_utf8(stream: TextIO) -> None:
+    """Write UTF-8 to a pipe or file, so names arrive exactly as they are.
+
+    A Windows console already takes Unicode. A pipe or a redirect to a file
+    otherwise falls back to the local code page, such as cp1252, which has no
+    emoji, so names would arrive as escapes and could not be pasted back in.
+    PYTHONIOENCODING, when set, is left to decide.
+    """
+    if os.environ.get("PYTHONIOENCODING"):
+        return
+    encoding = (getattr(stream, "encoding", None) or "").replace("_", "-").lower()
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is not None and encoding not in ("utf-8", "utf8"):
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass  # Keep writing in the stream's own encoding; _write copes.
+
+
 def _write(stream: TextIO, text: str) -> None:
     encoding = getattr(stream, "encoding", None)
     if encoding:
         text = text.encode(encoding, errors="backslashreplace").decode(encoding)
     stream.write(text)
+
+
+class _NoAnswer(Exception):
+    """There is nothing more to read, so no answer was given."""
+
+
+# Both the whole word and its first letter are accepted, in any case.
+_CHOICE_WORDS = {
+    "k": "keep", "keep": "keep",
+    "s": "skip", "skip": "skip",
+    "r": "rename", "rename": "rename",
+    "q": "quit", "quit": "quit", "stop": "quit",
+}
+_YES_NO = {"y": "yes", "yes": "yes", "n": "no", "no": "no", "q": "no", "quit": "no"}
+
+
+def _ask(
+    question: str,
+    words: dict[str, str],
+    reader: TextIO,
+    writer: TextIO,
+    empty: str | None = None,
+) -> str:
+    """Ask until one of the words is given; raise _NoAnswer at the end of input.
+
+    Nothing is ever assumed from an unreadable answer: an empty line means
+    only what ``empty`` says it means, and anything else is asked again.
+    """
+    while True:
+        _write(writer, question)
+        writer.flush()
+        line = reader.readline()
+        if not line:
+            raise _NoAnswer
+        text = line.strip().casefold()
+        if not text:
+            if empty is not None:
+                return empty
+            continue
+        answer = words.get(text)
+        if answer is not None:
+            return answer
+        wanted = sorted(set(words.values()))
+        _write(writer, f"Please answer {', '.join(wanted)}.\n")
+
+
+_OPTION_LABELS = {
+    "keep": "[k] keep this name",
+    "skip": "[s] skip this file",
+    "rename": "[r] rename to a free number",
+}
+
+
+def _show_conflict(
+    entry: dict,
+    plan: dict,
+    number: int,
+    total: int,
+    ruled_out: dict[str, str],
+    writer: TextIO,
+) -> None:
+    """Describe one conflict, and any answer already shown not to work."""
+    # JSON quoting keeps newlines and other filename controls on one line.
+    source = _quote(entry["source"])
+    destination = _quote(entry["destination"])
+    lines = ["", f"Conflict {number} of {total}: {source} -> {destination}"]
+    if entry["reason"]:
+        lines.append(f"  {entry['reason']}")
+    others = [
+        other["source"]
+        for other in plan["entries"]
+        if other is not entry
+        and other["status"] != "skipped"
+        and other["destination"].casefold() == entry["destination"].casefold()
+    ]
+    if others:
+        lines.append(
+            "  Also wanting this name: "
+            + ", ".join(_quote(name) for name in others)
+        )
+    for answer, why in ruled_out.items():
+        lines.append(f"  {answer.capitalize()} did not work for this file: {why}")
+    _write(writer, "\n".join(lines) + "\n")
+
+
+def _ask_choice(
+    source: str, ruled_out: dict[str, str], reader: TextIO, writer: TextIO
+) -> str:
+    """Ask for keep, skip, or rename, offering only answers that can still work.
+
+    Raises _NoAnswer at the end of input. Skip is never ruled out, since a
+    file left where it is cannot clash with anything.
+    """
+    options = [option for option in ("keep", "skip", "rename") if option not in ruled_out]
+    _write(
+        writer,
+        "  " + "   ".join(_OPTION_LABELS[option] for option in options) + "   [q] stop\n",
+    )
+    letters = "/".join(option[0] for option in options) + "/q"
+    # JSON quoting keeps newlines and other filename controls on one line.
+    quoted = _quote(source)
+    while True:
+        answer = _ask(f"Choose for {quoted} [{letters}]: ", _CHOICE_WORDS, reader, writer)
+        if answer not in ruled_out:
+            return answer
+        _write(
+            writer,
+            f"  {answer.capitalize()} cannot work for this file: {ruled_out[answer]}. "
+            f"Please answer {', '.join(options)}, or quit.\n",
+        )
+
+
+def _keep_blocker(plan: dict, source: str, choices: dict[str, str]) -> str | None:
+    """Say why keeping this file's planned name cannot work, or None if it can.
+
+    Only one file can have a name, and nothing is ever overwritten, so keeping
+    works only if the name is free once every other file wanting it steps
+    aside. That is tried against the answers given so far, looking only at
+    the destination folders; nothing is moved or written.
+    """
+    entries = [dict(entry, choice=choices.get(entry["source"])) for entry in plan["entries"]]
+    target = next(entry for entry in entries if entry["source"] == source)
+    name = (target["renamed_from"] or target["destination"]).casefold()
+    for entry in entries:
+        wanted = (entry["renamed_from"] or entry["destination"]).casefold()
+        if entry is target or wanted != name or entry["choice"] in ("skip", "rename"):
+            continue
+        if entry["choice"] == "keep":
+            return f"{entry['source']} already keeps this name"
+        entry["choice"] = "skip"  # Suppose the others step aside, as they must.
+    target["choice"] = "keep"
+    _apply_choices(entries, Path(plan["root"]), _DirectorySnapshot())
+    return target["reason"] if target["status"] == "conflict" else None
+
+
+def resolve_conflicts(
+    root: Path,
+    recursive: bool = False,
+    include_hidden: bool = False,
+    rules: dict | None = None,
+    check_duplicates: bool = False,
+    reader: TextIO | None = None,
+    writer: TextIO | None = None,
+) -> tuple[dict, bool]:
+    """Settle naming conflicts by asking in the terminal; change nothing.
+
+    Returns the plan and whether the questions were seen through to the end.
+    Each answer is keep, skip, or rename, exactly as a reviewed plan can carry
+    them, so this is the same mechanism without the JSON.
+
+    A keep is checked as soon as it is given. If the name is taken on disk,
+    already kept by another file, or blocked some other way, the reason is
+    shown and the same file is asked again with only skip and rename. The plan
+    is then built again from the folder after every round, so each answer is
+    judged against what is on disk then; an answer that still did not settle
+    its file is ruled out and the file is asked about again. Skip always
+    settles a file, so the questions always come to an end.
+    """
+    reader = sys.stdin if reader is None else reader
+    writer = sys.stderr if writer is None else writer
+    choices: dict[str, str] = {}
+    ruled_out: dict[str, dict[str, str]] = {}
+    plan = build_plan(root, recursive, include_hidden, rules, check_duplicates, choices)
+    while True:
+        conflicts = [entry for entry in plan["entries"] if entry["status"] == "conflict"]
+        if not conflicts:
+            return plan, True
+        total = len(conflicts)
+        _write(
+            writer,
+            f"{total} naming conflict{'' if total == 1 else 's'} to settle in "
+            f"{_quote(plan['root'])}.\n",
+        )
+        for number, entry in enumerate(conflicts, start=1):
+            source = entry["source"]
+            barred = ruled_out.setdefault(source, {})
+            _show_conflict(entry, plan, number, total, barred, writer)
+            while True:
+                try:
+                    answer = _ask_choice(source, barred, reader, writer)
+                except _NoAnswer:
+                    _write(writer, "\nNo answer was given, so nothing was settled.\n")
+                    return plan, False
+                if answer == "quit":
+                    _write(writer, "Stopped. Nothing was changed.\n")
+                    return plan, False
+                if answer == "keep":
+                    blocker = _keep_blocker(plan, source, choices)
+                    if blocker:
+                        barred["keep"] = blocker
+                        _write(
+                            writer,
+                            f"  Keep cannot work: {blocker}. Nothing is ever "
+                            "overwritten, so choose skip or rename instead.\n",
+                        )
+                        continue
+                choices[source] = answer
+                break
+        plan = build_plan(
+            root, recursive, include_hidden, rules, check_duplicates, choices
+        )
+        for entry in plan["entries"]:
+            source = entry["source"]
+            answer = choices.get(source)
+            if entry["status"] == "conflict" and answer in ("keep", "rename"):
+                ruled_out.setdefault(source, {})[answer] = entry["reason"]
+                _write(
+                    writer,
+                    f"\n{answer.capitalize()} did not settle "
+                    f"{_quote(source)}: {entry['reason']}. "
+                    "It will be asked about again.\n",
+                )
+
+
+def _confirm_plan(plan: dict, reader: TextIO, writer: TextIO) -> bool:
+    """Show what the answers settled, then ask once before anything moves."""
+    settled = [entry for entry in plan["entries"] if entry["choice"]]
+    lines = [""]
+    if settled:
+        lines.append(f"Settled {len(settled)} of them:")
+        for entry in settled:
+            # JSON quoting keeps newlines and other filename controls on one line.
+            source = _quote(entry["source"])
+            destination = _quote(entry["destination"])
+            if entry["choice"] == "skip":
+                lines.append(f"  skip    {source} (left where it is)")
+            else:
+                lines.append(f"  {entry['choice']:<7} {source} -> {destination}")
+    summary = plan["summary"]
+    lines.append(
+        f"{summary['ready']} file{'' if summary['ready'] == 1 else 's'} to move"
+        + (f", {summary['skipped']} to leave alone" if summary["skipped"] else "")
+        + "."
+    )
+    _write(writer, "\n".join(lines) + "\n")
+    try:
+        return _ask("Move them now? [y/N]: ", _YES_NO, reader, writer, empty="no") == "yes"
+    except _NoAnswer:
+        _write(writer, "\nNo answer was given, so nothing was moved.\n")
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2476,7 +3910,23 @@ def main(argv: list[str] | None = None) -> int:
         metavar="RECORD",
         help="put the files in a run record back where they were",
     )
+    parser.add_argument(
+        "--resolve",
+        action="store_true",
+        help="settle each naming conflict in the terminal: keep, skip, or rename",
+    )
+    parser.add_argument(
+        "--show",
+        nargs="?",
+        const="",
+        metavar="RECORD",
+        help="say what a run record did and where its files are now, which is "
+        "how to see what an interrupted run left behind; with no RECORD, the "
+        "newest record in the folder. Changes nothing",
+    )
     args = parser.parse_args(argv)
+    _speak_utf8(sys.stdout)
+    _speak_utf8(sys.stderr)
     try:
         if args.rules is not None and (args.verify is not None or args.undo is not None):
             raise FilePlanError(
@@ -2488,7 +3938,73 @@ def main(argv: list[str] | None = None) -> int:
                 "--check-duplicates shapes a new preview; a saved plan already records "
                 "whether contents were compared, so remove --check-duplicates"
             )
-        if args.undo is not None:
+        if args.show is not None:
+            for given, name in (
+                (args.apply, "--apply"),
+                (args.verify is not None, "--verify"),
+                (args.undo is not None, "--undo"),
+                (args.resolve, "--resolve"),
+                (args.rules is not None, "--rules"),
+                (args.check_duplicates, "--check-duplicates"),
+                (args.recursive, "--recursive"),
+                (args.include_hidden, "--include-hidden"),
+            ):
+                if given:
+                    raise FilePlanError(
+                        f"--show reads a run record by itself; remove {name}"
+                    )
+            record_path = Path(args.show) if args.show else latest_record(args.root)
+            report = inspect_run(load_record(record_path), args.root, record_path)
+            problems = report["summary"]["unclear"] or not report["summary"][
+                "record_complete"
+            ]
+        elif args.resolve and (args.verify is not None or args.undo is not None):
+            raise FilePlanError(
+                "--resolve settles the conflicts in a new preview; a saved plan "
+                "or record already carries its own choices, so remove --resolve"
+            )
+        elif args.resolve:
+            rules = load_rules(args.rules) if args.rules is not None else None
+            try:
+                plan, settled = resolve_conflicts(
+                    args.root,
+                    args.recursive,
+                    args.include_hidden,
+                    rules,
+                    args.check_duplicates,
+                    sys.stdin,
+                    sys.stderr,
+                )
+            except KeyboardInterrupt:
+                _write(sys.stderr, "\nStopped. Nothing was changed.\n")
+                return 1
+            if not settled:
+                return 1
+            if not args.apply:
+                report = plan
+                problems = report["summary"]["conflicts"]
+            else:
+                left = plan["summary"]["conflicts"]
+                if left:
+                    _write(
+                        sys.stderr,
+                        f"{left} conflict{'' if left == 1 else 's'} "
+                        f"{'is' if left == 1 else 'are'} still unsettled, so the "
+                        "plan will be refused and nothing moved.\n",
+                    )
+                elif plan["summary"]["ready"]:
+                    try:
+                        moving = _confirm_plan(plan, sys.stdin, sys.stderr)
+                    except KeyboardInterrupt:
+                        _write(sys.stderr, "\nStopped. Nothing was moved.\n")
+                        return 1
+                    if not moving:
+                        _write(sys.stderr, "Nothing was moved.\n")
+                        return 1
+                else:
+                    _write(sys.stderr, "There is nothing to move.\n")
+                report = apply_plan(plan, args.root, None)
+        elif args.undo is not None:
             if args.apply or args.verify is not None:
                 raise FilePlanError(
                     "--undo works on a run record by itself; remove --apply and --verify"
@@ -2502,7 +4018,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verify is None:
             if args.apply:
                 raise FilePlanError(
-                    "--apply needs a reviewed plan: add --verify PLAN"
+                    "--apply needs a reviewed plan: add --verify PLAN, or "
+                    "--resolve to settle the conflicts in the terminal first"
                 )
             rules = load_rules(args.rules) if args.rules is not None else None
             report = build_plan(
@@ -2526,12 +4043,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.format == "json":
         output = json.dumps(report, indent=2, ensure_ascii=True) + "\n"
+    elif args.show is not None:
+        output = _plain_run_output(report)
     elif args.undo is not None:
         output = _plain_undo_output(report)
-    elif args.verify is None:
-        output = _plain_output(report)
     elif args.apply:
         output = _plain_application_output(report)
+    elif args.verify is None:
+        output = _plain_output(report)
     else:
         output = _plain_verification_output(report)
     _write(sys.stdout, output)

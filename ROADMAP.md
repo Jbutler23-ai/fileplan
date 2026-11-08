@@ -9,8 +9,10 @@ remains. Estimates include implementation, tests, and documentation.
 These are settled decisions, not open questions. Anything added later has to
 keep them true, and each one has tests that fail if it stops being true.
 
-- **Nothing moves unless it is asked for.** Previewing and verifying never
-  change a file, create a folder, or write a record.
+- **Nothing moves unless it is asked for.** Previewing, verifying, and
+  looking at a run never change a file, create a folder, or write a record.
+  Answering conflicts in the terminal only shapes the plan; `--apply` and a
+  yes to the one confirming question are still what move a file.
 - **One way to move a file.** A single no-replace rename through folder handles
   opened without following links. If that is unavailable, stop; never fall back
   to a method that could replace a file or follow a link.
@@ -45,12 +47,13 @@ A plan can be verified, applied, and undone, and every run writes an
 append-only record as it goes. A run cut off partway leaves a record that says
 which file was in flight, and undo reads it to recover.
 
-## Applying beyond Linux (6-9 hours)
+## Applying beyond Linux (2-3 hours left)
 
-Applying needs a rename that refuses to replace, which only Linux offers today.
-Previewing and verifying already work everywhere.
+Applying needs a rename that refuses to replace. Linux and Windows both apply
+and undo with the full guarantee; Windows goes through the NT API with folder
+handles that also stop the folders being moved mid-run. Previewing and
+verifying already work everywhere.
 
-- Find out whether Windows can give the same guarantee, and at what cost.
 - Decide what macOS should do: refuse, or accept a stated weaker guarantee.
 - Keep the refusal clear and tested wherever the guarantee cannot be met.
 
@@ -73,5 +76,37 @@ and timestamp cannot slip a changed file through. A reviewed plan can carry
 keep, skip, or rename on each entry; unresolved clashes still refuse to apply.
 A plan that would need one path to be both a file and a folder is a conflict.
 
-The remaining estimate is **6-9 hours**. These are proposed next steps, not
+## Settling conflicts in the terminal (done)
+
+`--resolve` asks about each conflict at the prompt and takes keep, skip, or
+rename as the answer, so the choices a plan can carry no longer have to be
+written into JSON by hand. The answers only shape the plan: nothing moves
+until `--apply` is given as well and the one confirming question is answered.
+A keep that cannot work is refused on the spot with the reason, and the same
+file is asked again with only skip and rename.
+
+## Looking at a run (done)
+
+`--show` reads a run record and says what that run did and where each of its
+files is now, which is how to see what an interrupted run left behind: the
+file that was in flight when it stopped, the ones that never started, and
+whether an undo would be able to put everything back. A run that has been
+undone says so, file by file, rather than calling its files unmoved, and an
+undo is only called finished when its own record says it completed. What the
+record says became of each file is counted from the record alone, so those
+counts read the same however the files are moved afterwards. Undos, redos, and
+undos of those are followed to any depth, and each is credited only with what
+its own record says, so undoing and redoing again never changes a count
+already shown. A file with no recorded outcome is never said to have stayed
+put. Every direction it reports is physical, into the organised folder or out
+of it, read from each run's own entries, so it reads correctly for an undo
+record as well as an apply. Nothing is credited as moved unless a record
+confirms it: a run's direction is what it set out to do, and moves that were
+not confirmed or were cut off are named apart. It changes nothing.
+
+Names in plain output are printed exactly as they are, emoji and Windows
+backslashes included, and pipes and files get UTF-8, so a printed path can be
+pasted back into the next command.
+
+The remaining estimate is **2-3 hours**. These are proposed next steps, not
 claims about past development time or a release schedule.

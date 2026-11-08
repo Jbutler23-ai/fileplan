@@ -16,6 +16,41 @@ from unittest import mock
 import fileplan
 
 
+def _windows_access_list(path):
+    """Return the file's access list as an SDDL string (Windows only)."""
+    import ctypes
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    descriptor = ctypes.c_void_p()
+    text = wintypes.LPWSTR()
+    dacl_information = 4
+    advapi32.GetNamedSecurityInfoW.argtypes = [
+        wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR), ctypes.c_void_p,
+    ]
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path), 1, dacl_information, None, None, None, None, ctypes.byref(descriptor)
+    )
+    if status:
+        raise ctypes.WinError(status)
+    try:
+        if not advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor, 1, dacl_information, ctypes.byref(text), None
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return text.value
+        finally:
+            ctypes.windll.kernel32.LocalFree(text)
+    finally:
+        ctypes.windll.kernel32.LocalFree(descriptor)
+
+
 class FileplanTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -871,6 +906,27 @@ class ApplyTests(_ApplyFixture):
         self.assertEqual(report["verification"]["summary"]["new"], 1)
         self.assertEqual(self.tree(), before)
 
+    def pinned_on_windows(self, change) -> bool:
+        """Try change(); on Windows it must be refused because fileplan holds the folder.
+
+        Returns True when Windows refused it, so the caller skips the rest.
+        """
+        if sys.platform != "win32":
+            change()
+            return False
+        with self.assertRaises(PermissionError):
+            change()
+        return True
+
+    def assert_moved_safely_despite_pinned_folder(self, report, outside):
+        self.assertEqual(report["summary"]["moved"], 1)
+        self.assertEqual(report["results"][0]["outcome"], "moved")
+        self.assertTrue(report["summary"]["completed"])
+        self.assertEqual(
+            (self.root / "_organized/txt/tidy-me.txt").read_bytes(), b"pretend contents"
+        )
+        self.assertEqual(list(outside.iterdir()), [])
+
     def after_destination_check(self, disturb):
         """Run disturb() once, right after the first free-destination check.
 
@@ -935,12 +991,16 @@ class ApplyTests(_ApplyFixture):
         folder = self.root / "_organized/txt"
 
         def disturb():
-            folder.rmdir()
+            if self.pinned_on_windows(folder.rmdir):
+                return
             self.link_directory(folder, outside)
 
         with self.after_destination_check(disturb):
             report = self.apply(plan_path)
 
+        if sys.platform == "win32":
+            self.assert_moved_safely_despite_pinned_folder(report, outside)
+            return
         self.assertEqual(report["summary"]["moved"], 0)
         self.assertIn("is a link or reparse point", report["stopped"]["reason"])
         self.assertEqual(list(outside.iterdir()), [])
@@ -954,12 +1014,17 @@ class ApplyTests(_ApplyFixture):
         moved_aside = self.root / "_organized/txt-moved"
 
         def disturb():
-            folder.rename(moved_aside)
+            if self.pinned_on_windows(lambda: folder.rename(moved_aside)):
+                return
             self.link_directory(folder, outside)
 
         with self.after_destination_check(disturb):
             report = self.apply(plan_path)
 
+        if sys.platform == "win32":
+            self.assert_moved_safely_despite_pinned_folder(report, outside)
+            self.assertFalse(moved_aside.exists())
+            return
         self.assertEqual(report["summary"]["moved"], 0)
         self.assertIn("is a link or reparse point", report["stopped"]["reason"])
         self.assertEqual(list(outside.iterdir()), [])
@@ -1093,6 +1158,15 @@ class ApplyTests(_ApplyFixture):
         with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
             report = self.apply(plan_path)
 
+        if sys.platform == "win32":
+            # Windows opens the name as a reparse point and refuses to move it.
+            self.assertEqual(report["summary"]["moved"], 0)
+            self.assertEqual(report["results"][0]["outcome"], "not-moved")
+            self.assertIn("link or reparse point", report["stopped"]["reason"])
+            self.assertTrue(source.is_symlink())
+            self.assertFalse((self.root / "_organized/txt/tidy-me.txt").exists())
+            self.assertEqual(decoy.read_bytes(), b"pretend decoy")
+            return
         self.assertEqual(report["summary"]["moved"], 1)
         self.assertEqual(report["summary"]["moved_unconfirmed"], 1)
         self.assertEqual(report["summary"]["not_moved"], 0)
@@ -1109,10 +1183,14 @@ class ApplyTests(_ApplyFixture):
         folder = self.root / "_organized/txt"
 
         def disturb():
-            folder.rename(outside / "txt")
+            self.pinned_on_windows(lambda: folder.rename(outside / "txt"))
 
         with self.after_destination_check(disturb):
             report = self.apply(plan_path)
+
+        if sys.platform == "win32":
+            self.assert_moved_safely_despite_pinned_folder(report, outside)
+            return
 
         self.assertEqual(report["summary"]["moved"], 0)
         self.assertEqual(report["results"][0]["outcome"], "not-moved")
@@ -1128,11 +1206,15 @@ class ApplyTests(_ApplyFixture):
         real_rename = fileplan._rename_noreplace
 
         def rename(*args):
-            folder.rename(outside / "txt")
+            self.pinned_on_windows(lambda: folder.rename(outside / "txt"))
             real_rename(*args)
 
         with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
             report = self.apply(plan_path)
+
+        if sys.platform == "win32":
+            self.assert_moved_safely_despite_pinned_folder(report, outside)
+            return
 
         reason = report["stopped"]["reason"]
         self.assertEqual(report["summary"]["moved"], 1)
@@ -1790,7 +1872,12 @@ class RecordTests(_ApplyFixture):
 
         report = self.apply(plan_path)
 
-        mode = stat.S_IMODE(Path(report["record"]["path"]).stat().st_mode)
+        path = Path(report["record"]["path"])
+        if sys.platform == "win32":
+            # Mode bits mean nothing on Windows; the access list does.
+            self.assertEqual(_windows_access_list(path), fileplan._WINDOWS.PRIVATE_FILE_SDDL)
+            return
+        mode = stat.S_IMODE(path.stat().st_mode)
         self.assertEqual(mode & 0o077, 0)
 
     def test_no_record_is_written_without_apply_or_for_an_empty_plan(self):
@@ -2101,6 +2188,32 @@ class UndoTests(_ApplyFixture):
                 self.assertEqual(stdout, "")
                 self.assertIn("--undo", stderr)
 
+    def test_names_with_emoji_move_and_come_back_whole(self):
+        # Emoji sit outside the Basic Multilingual Plane, so each one is two
+        # UTF-16 code units. Windows measures names in those units, and a name
+        # measured in characters instead is cut short and reported missing.
+        self.write("\U0001f642 note.txt", b"pretend smile")
+        self.write("\U0001f4c1 drafts/plan \U0001f680.md", b"pretend launch")
+        report, record_path = self.apply_and_record(recursive=True)
+
+        self.assertTrue(report["summary"]["completed"])
+        self.assertEqual(report["summary"]["moved"], 2)
+        self.assertEqual(
+            (self.root / "_organized/txt/\U0001f642 note.txt").read_bytes(), b"pretend smile"
+        )
+        self.assertEqual(
+            (self.root / "_organized/md/plan \U0001f680.md").read_bytes(), b"pretend launch"
+        )
+
+        undone = self.undo(record_path)
+
+        self.assertTrue(undone["summary"]["completed"])
+        self.assertEqual(undone["summary"]["restored_confirmed"], 2)
+        self.assertEqual((self.root / "\U0001f642 note.txt").read_bytes(), b"pretend smile")
+        self.assertEqual(
+            (self.root / "\U0001f4c1 drafts/plan \U0001f680.md").read_bytes(), b"pretend launch"
+        )
+
     def test_a_file_is_not_called_restored_unless_it_is_at_its_original_name(self):
         # The move succeeds, but the path to the original name is swapped for
         # a link, so the file is not where the record says it should be.
@@ -2112,6 +2225,11 @@ class UndoTests(_ApplyFixture):
 
         def rename(*args):
             real_rename(*args)
+            if sys.platform == "win32":
+                # fileplan holds drafts open, so Windows refuses to remove it.
+                with self.assertRaises(PermissionError):
+                    drafts.rename(self.root / "drafts-aside")
+                return
             for leftover in drafts.iterdir():
                 leftover.rename(outside / leftover.name)
             drafts.rmdir()
@@ -2119,6 +2237,15 @@ class UndoTests(_ApplyFixture):
 
         with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
             report = self.undo(record_path)
+
+        if sys.platform == "win32":
+            self.assertEqual(report["results"][0]["outcome"], "restored")
+            self.assertTrue(report["summary"]["completed"])
+            self.assertEqual(
+                (self.root / "drafts/early-idea.md").read_bytes(), b"pretend early idea"
+            )
+            self.assertEqual(list(outside.iterdir()), [])
+            return
 
         item = report["results"][0]
         self.assertEqual(item["outcome"], "restored-unconfirmed")
@@ -2887,6 +3014,35 @@ class ConflictChoiceTests(unittest.TestCase):
         self.assertTrue(plan["options"]["check_duplicates"])
         self.assertEqual(plan["summary"]["conflicts"], 3)
 
+    def test_duplicate_check_reads_past_a_ctrl_z_byte(self):
+        # On Windows a text-mode read stops at 0x1A, which made these look identical.
+        self.write("one/notes.txt", b"same start\x1aone ending")
+        self.write("two/notes.txt", b"same start\x1atwo ending")
+        plan = fileplan.build_plan(self.root, recursive=True, check_duplicates=True)
+        got = self.by_source(plan)
+        self.assertNotEqual(got["one/notes.txt"]["sha256"], got["two/notes.txt"]["sha256"])
+        self.assertEqual(got["one/notes.txt"]["identical_to"], [])
+        self.assertEqual(got["one/notes.txt"]["differs_from"], ["two/notes.txt"])
+        expected = hashlib.sha256(b"same start\x1aone ending").hexdigest()
+        self.assertEqual(got["one/notes.txt"]["sha256"], expected)
+
+    def test_a_short_read_is_never_called_identical(self):
+        self.write("one/notes.txt", b"shared prefix, then one")
+        self.write("two/notes.txt", b"shared prefix, then two")
+        real_read = os.read
+
+        def stop_early(fd, size):
+            # Mimic a text-mode read that ends at the first comma.
+            data = real_read(fd, size)
+            return data.split(b",", 1)[0] if b"," in data else data
+
+        with mock.patch.object(fileplan.os, "read", side_effect=stop_early):
+            plan = fileplan.build_plan(self.root, recursive=True, check_duplicates=True)
+        for entry in self.by_source(plan).values():
+            self.assertIsNone(entry.get("sha256"))
+            self.assertNotIn("Contents identical", entry["reason"])
+            self.assertIn("so contents were not compared", entry["reason"])
+
     def test_duplicate_check_compares_against_an_existing_destination(self):
         self.write("notes.txt", b"pretend notes")
         self.write("_organized/txt/notes.txt", b"pretend notes")
@@ -2936,8 +3092,8 @@ class ConflictChoiceTests(unittest.TestCase):
         self.write("two/notes.txt", b"pretend two")
         real_digest = fileplan._digest
 
-        def digest(fd):
-            result = real_digest(fd)
+        def digest(fd, expected_size):
+            result = real_digest(fd, expected_size)
             if os.fstat(fd).st_size == len(b"pretend one"):
                 with target.open("ab") as handle:
                     handle.write(b" and then some")
@@ -3093,6 +3249,18 @@ class ComparedContentsTests(_ApplyFixture):
         folder = self.root / "_organized" / fileplan.JOURNAL_DIRECTORY
         return sorted(p for p in folder.iterdir()) if folder.exists() else []
 
+    def test_the_recheck_before_moving_reads_past_a_ctrl_z_byte(self):
+        content = b"same start\x1aonly the end differs"
+        self.write("notes.txt", content)
+        root_fd = fileplan._open_root(self.root)
+        try:
+            checked = fileplan._stat_at(root_fd, "notes.txt")
+            digest, reason = fileplan._digest_at(root_fd, "notes.txt", checked, "notes.txt")
+        finally:
+            os.close(root_fd)
+        self.assertIsNone(reason)
+        self.assertEqual(digest, hashlib.sha256(content).hexdigest())
+
     def test_apply_stops_when_compared_contents_change_behind_identical_metadata(self):
         self.write("one/notes.txt", b"the first pretend text")
         self.write("two/notes.txt", b"the first pretend text")
@@ -3245,6 +3413,1430 @@ class ComparedContentsTests(_ApplyFixture):
         self.assertEqual(code, 2)
         self.assertEqual(stdout, "")
         self.assertIn("64 hex characters", stderr)
+
+
+class _TerminalFixture(_ApplyFixture):
+    """Answers typed at the prompts, with stdin standing in for a terminal."""
+
+    def answer(self, *answers):
+        """Feed one line per answer, the way someone typing them would."""
+        return io.StringIO("".join(f"{answer}\n" for answer in answers))
+
+    def run_cli(self, *args, answers=()):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        typed = answers if isinstance(answers, io.StringIO) else self.answer(*answers)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with mock.patch.object(fileplan.sys, "stdin", typed):
+                code = fileplan.main(list(args))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def three_sharing_a_name(self):
+        for folder in ("one", "two", "three"):
+            self.write(f"{folder}/notes.txt", f"pretend {folder}\n".encode())
+
+
+class TerminalChoiceTests(_TerminalFixture):
+    """Settling conflicts by answering in the terminal. Nothing is moved here."""
+
+    def test_keep_skip_and_rename_answers_settle_a_shared_name(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=("k", "s", "r")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("3 naming conflicts to settle", stderr)
+        # Conflicts are asked about in the order they appear in the plan.
+        self.assertIn('[ready] "one/notes.txt" -> "_organized/txt/notes.txt"', stdout)
+        self.assertIn('[skipped] "three/notes.txt"', stdout)
+        self.assertIn('"two/notes.txt" -> "_organized/txt/notes (2).txt"', stdout)
+        self.assertIn("0 conflicts", stdout)
+        self.assertIn("Preview only. No files were changed.", stdout)
+        self.assertEqual(self.tree(), before)
+
+    def test_whole_words_are_accepted_as_well_as_letters(self):
+        self.three_sharing_a_name()
+
+        code, stdout, _ = self.run_cli(
+            str(self.root),
+            "--recursive",
+            "--resolve",
+            answers=("KEEP", "Skip", "rename"),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("0 conflicts", stdout)
+
+    def test_a_question_names_the_other_files_wanting_the_same_name(self):
+        self.three_sharing_a_name()
+
+        _, _, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=("k", "s", "s")
+        )
+
+        self.assertIn('Conflict 1 of 3: "one/notes.txt"', stderr)
+        self.assertIn("Multiple source files share this destination", stderr)
+        self.assertIn(
+            'Also wanting this name: "three/notes.txt", "two/notes.txt"', stderr
+        )
+        self.assertIn("[k] keep this name", stderr)
+
+    def test_an_answer_that_is_not_one_of_the_three_is_asked_again(self):
+        self.write("one/notes.txt", b"pretend one")
+        self.write("two/notes.txt", b"pretend two")
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=("maybe", "", "k", "s")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Please answer keep, quit, rename, skip.", stderr)
+        self.assertIn("0 conflicts", stdout)
+
+    def test_quitting_leaves_everything_as_it_was(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=("q",)
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Stopped. Nothing was changed.", stderr)
+        self.assertEqual(self.tree(), before)
+
+    def test_the_end_of_input_settles_nothing(self):
+        self.three_sharing_a_name()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=()
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("No answer was given", stderr)
+
+    def taken_on_disk(self):
+        (self.root / "_organized" / "txt").mkdir(parents=True)
+        (self.root / "_organized" / "txt" / "notes.txt").write_bytes(b"pretend older")
+        self.write("notes.txt", b"pretend newer")
+
+    def test_a_keep_that_cannot_work_is_refused_at_once(self):
+        self.taken_on_disk()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--resolve", answers=("k", "r")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "Keep cannot work: Destination already exists: _organized/txt/notes.txt",
+            stderr,
+        )
+        # The same file is asked again straight away, without keep on offer.
+        self.assertIn(
+            "  [s] skip this file   [r] rename to a free number   [q] stop\n"
+            'Choose for "notes.txt" [s/r/q]: ',
+            stderr,
+        )
+        self.assertEqual(stderr.count("Conflict 1 of 1"), 1)
+        self.assertIn('"notes.txt" -> "_organized/txt/notes (2).txt"', stdout)
+        self.assertIn("0 conflicts", stdout)
+
+    def test_keep_typed_again_is_explained_and_asked_again(self):
+        self.taken_on_disk()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--resolve", answers=("k", "keep", "s")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn(
+            "Keep cannot work for this file: Destination already exists", stderr
+        )
+        self.assertIn("Please answer skip, rename, or quit.", stderr)
+        self.assertIn('[skipped] "notes.txt"', stdout)
+
+    def test_a_second_keep_of_the_same_name_is_refused_at_once(self):
+        self.write("one/notes.txt", b"pretend one")
+        self.write("two/notes.txt", b"pretend two")
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", answers=("k", "k", "r")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Keep cannot work: one/notes.txt already keeps this name", stderr)
+        self.assertIn('"one/notes.txt" -> "_organized/txt/notes.txt", kept by choice', stdout)
+        self.assertIn('"two/notes.txt" -> "_organized/txt/notes (2).txt"', stdout)
+
+    def test_an_answer_that_did_not_settle_its_file_is_asked_about_again(self):
+        self.taken_on_disk()
+
+        # Suppose the clash only shows once the folder is looked at again.
+        with mock.patch.object(fileplan, "_keep_blocker", return_value=None):
+            code, stdout, stderr = self.run_cli(
+                str(self.root), "--resolve", answers=("k", "r")
+            )
+
+        self.assertEqual(code, 0)
+        self.assertIn('Keep did not settle "notes.txt"', stderr)
+        self.assertIn("Keep did not work for this file:", stderr)
+        self.assertIn('Choose for "notes.txt" [s/r/q]: ', stderr)
+        self.assertIn("0 conflicts", stdout)
+
+    def test_nothing_is_asked_when_there_are_no_conflicts(self):
+        self.write("tidy-me.txt", b"pretend contents")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--resolve")
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("Conflict", stderr)
+        self.assertIn("1 files: 1 ready, 0 conflicts", stdout)
+
+    def test_answers_work_alongside_custom_rules(self):
+        self.write("one/report.pdf", b"pretend one")
+        self.write("two/report.pdf", b"pretend two")
+        rules = self.plans / "rules.json"
+        rules.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "rules": [{"name": "paper", "extensions": ["pdf"], "folder": "paper"}],
+                    "fallback": "by-extension",
+                }
+            )
+        )
+
+        code, stdout, _ = self.run_cli(
+            str(self.root),
+            "--recursive",
+            "--resolve",
+            "--rules",
+            str(rules),
+            answers=("k", "r"),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn('"one/report.pdf" -> "_organized/paper/report.pdf"', stdout)
+        self.assertIn('"two/report.pdf" -> "_organized/paper/report (2).pdf"', stdout)
+
+    def test_resolve_is_refused_with_a_saved_plan_or_a_record(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        plan_path = self.save_plan()
+
+        for extra in (("--verify", str(plan_path)), ("--undo", str(plan_path))):
+            with self.subTest(extra=extra[0]):
+                code, stdout, stderr = self.run_cli(str(self.root), "--resolve", *extra)
+
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn("remove --resolve", stderr)
+
+    def test_apply_without_a_plan_points_at_resolve(self):
+        self.write("tidy-me.txt", b"pretend contents")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--apply")
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("--resolve", stderr)
+
+
+@unittest.skipUnless(
+    fileplan._SAFE_MOVE_SUPPORTED, "needs directory handles and hard links"
+)
+class TerminalApplyTests(_TerminalFixture):
+    """Moving the files settled in the terminal, once it has been confirmed."""
+
+    def record_files(self):
+        folder = self.root / "_organized" / fileplan.JOURNAL_DIRECTORY
+        return sorted(folder.iterdir()) if folder.exists() else []
+
+    def test_answering_yes_moves_the_files_as_settled(self):
+        self.three_sharing_a_name()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply",
+            answers=("k", "s", "r", "y"),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Move them now? [y/N]: ", stderr)
+        self.assertIn("Moved 2 of 3 files.", stdout)
+        self.assertEqual(
+            self.tree(),
+            {
+                "_organized/txt/notes.txt": b"pretend one\n",
+                "_organized/txt/notes (2).txt": b"pretend two\n",
+                "three/notes.txt": b"pretend three\n",
+            },
+        )
+
+    def test_the_run_is_recorded_and_can_be_undone(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply",
+            answers=("k", "s", "r", "yes"),
+        )
+        records = self.record_files()
+        self.assertEqual(len(records), 1)
+        code, stdout, _ = self.run_cli(str(self.root), "--undo", str(records[0]))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Put back 2 of 2 files.", stdout)
+        self.assertEqual(self.tree(), before)
+
+    def test_answering_no_moves_nothing(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply",
+            answers=("k", "s", "r", "n"),
+        )
+
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("Nothing was moved.", stderr)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.record_files(), [])
+
+    def test_no_answer_to_the_last_question_moves_nothing(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply",
+            answers=("k", "s", "r"),
+        )
+
+        self.assertEqual((code, stdout), (1, ""))
+        self.assertIn("No answer was given, so nothing was moved.", stderr)
+        self.assertEqual(self.tree(), before)
+
+    def test_the_settled_moves_are_shown_before_the_question(self):
+        self.three_sharing_a_name()
+
+        _, _, stderr = self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply",
+            answers=("k", "s", "r", "n"),
+        )
+
+        self.assertIn('keep    "one/notes.txt" -> "_organized/txt/notes.txt"', stderr)
+        self.assertIn('skip    "three/notes.txt" (left where it is)', stderr)
+        self.assertIn('rename  "two/notes.txt" -> "_organized/txt/notes (2).txt"', stderr)
+        self.assertIn("2 files to move, 1 to leave alone.", stderr)
+
+    def test_a_refused_keep_then_rename_moves_the_file_aside(self):
+        (self.root / "_organized" / "txt").mkdir(parents=True)
+        (self.root / "_organized" / "txt" / "notes.txt").write_bytes(b"pretend older")
+        self.write("notes.txt", b"pretend newer")
+
+        code, stdout, stderr = self.run_cli(
+            str(self.root), "--resolve", "--apply", answers=("k", "r", "y")
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("Keep cannot work", stderr)
+        self.assertIn("1 file to move.", stderr)
+        self.assertEqual(
+            self.tree(),
+            {
+                "_organized/txt/notes.txt": b"pretend older",
+                "_organized/txt/notes (2).txt": b"pretend newer",
+            },
+        )
+
+    def test_quitting_before_the_end_moves_nothing(self):
+        self.three_sharing_a_name()
+        before = self.tree()
+
+        code, _, _ = self.run_cli(
+            str(self.root), "--recursive", "--resolve", "--apply", answers=("k", "q")
+        )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(self.record_files(), [])
+
+    def test_a_folder_with_nothing_to_move_asks_nothing(self):
+        code, stdout, stderr = self.run_cli(str(self.root), "--resolve", "--apply")
+
+        self.assertEqual(code, 0)
+        self.assertIn("There is nothing to move.", stderr)
+        self.assertIn("Moved 0 of 0 files.", stdout)
+
+
+@unittest.skipUnless(
+    fileplan._SAFE_MOVE_SUPPORTED, "needs directory handles and hard links"
+)
+class RunInspectionTests(_ApplyFixture):
+    """Looking at what a run did, including one that was cut off partway."""
+
+    def record_files(self):
+        folder = self.root / "_organized" / fileplan.JOURNAL_DIRECTORY
+        return sorted(folder.iterdir()) if folder.exists() else []
+
+    def cut_off_run(self, names, stop_before=True, at=2):
+        """Apply a plan and stop it dead partway, as an interruption would."""
+        for name in names:
+            self.write(name, f"pretend {name}\n".encode())
+        plan_path = self.save_plan(f"plan-{len(self.record_files())}.json")
+        before = set(self.record_files())
+        real_rename = fileplan._rename_noreplace
+        calls = []
+
+        def rename(*args):
+            calls.append(args)
+            if len(calls) == at and stop_before:
+                raise KeyboardInterrupt
+            real_rename(*args)
+            if len(calls) == at and not stop_before:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
+            with self.assertRaises(KeyboardInterrupt):
+                self.apply(plan_path)
+        written = set(self.record_files()) - before
+        self.assertEqual(len(written), 1)
+        return written.pop()
+
+    def test_a_finished_run_is_reported_as_complete(self):
+        self.write("a-first.txt", b"pretend first")
+        self.write("b-second.md", b"pretend second")
+        report = self.apply(self.save_plan())
+        record = Path(report["record"]["path"])
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("From applying a plan in", stdout)
+        self.assertIn("The run finished and the record is complete.", stdout)
+        self.assertIn(
+            '[moved] "a-first.txt" -> "_organized/txt/a-first.txt" '
+            "(the file is there now)",
+            stdout,
+        )
+        self.assertIn("--undo on this record would move 2 files.", stdout)
+        self.assertIn("Look only. No files were changed.", stdout)
+
+    def test_an_interrupted_run_names_the_file_that_was_in_flight(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], at=2)
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("The run was cut off: the record has no closing entry", stdout)
+        self.assertIn("Planned 3 files; the record covers 2.", stdout)
+        self.assertIn("1 file was never started.", stdout)
+        self.assertIn('[moved] "a.txt"', stdout)
+        # The record has no outcome for the second file, so the report makes
+        # no claim about whether it moved, wherever it is found now.
+        self.assertIn(
+            '[no outcome] "b.txt" -> "_organized/txt/b.txt" (the file is at '
+            '"b.txt" now; the record has no outcome for it, so whether it moved '
+            "is not known)",
+            stdout,
+        )
+        self.assertNotIn("did not move", stdout)
+        self.assertIn('In flight when it stopped: "b.txt".', stdout)
+
+    def test_a_file_moved_but_never_recorded_is_found_at_its_destination(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], stop_before=False, at=2)
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn(
+            '[no outcome] "b.txt" -> "_organized/txt/b.txt" (the file is there now)',
+            stdout,
+        )
+        self.assertIn('In flight when it stopped: "b.txt".', stdout)
+        self.assertIn("--undo on this record would move 2 files.", stdout)
+
+    def test_an_interrupted_run_can_be_looked_at_then_undone(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], at=2)
+        before = self.tree()
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+        self.assertEqual(code, 0)
+        # Looking changes nothing at all.
+        self.assertEqual(self.tree(), before)
+
+        code, stdout, _ = self.run_cli(str(self.root), "--undo", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.tree(),
+            {
+                "a.txt": b"pretend a.txt\n",
+                "b.txt": b"pretend b.txt\n",
+                "c.txt": b"pretend c.txt\n",
+            },
+        )
+
+    def test_the_newest_record_is_used_when_none_is_named(self):
+        self.write("a-first.txt", b"pretend first")
+        first = Path(self.apply(self.save_plan())["record"]["path"])
+        self.write("b-second.txt", b"pretend second")
+        second = Path(self.apply(self.save_plan("second.json"))["record"]["path"])
+        self.assertNotEqual(first, second)
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show")
+
+        self.assertEqual(code, 0)
+        self.assertIn(second.name, stdout)
+        self.assertNotIn(first.name, stdout)
+
+    def test_a_folder_with_no_records_says_so(self):
+        self.write("tidy-me.txt", b"pretend contents")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show")
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("No run records in", stderr)
+
+    def test_a_file_in_neither_place_is_reported_as_in_doubt(self):
+        self.write("a-first.txt", b"pretend first")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        (self.root / "_organized" / "txt" / "a-first.txt").unlink()
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertIn("in doubt:", stdout)
+        self.assertIn("The file is in neither place", stdout)
+        self.assertIn(
+            "1 of 1 entries are in doubt, so --undo would be refused", stdout
+        )
+
+    def test_files_left_alone_by_choice_are_not_called_never_started(self):
+        self.write("one/notes.txt", b"pretend one")
+        self.write("two/notes.txt", b"pretend two")
+        plan = fileplan.build_plan(
+            self.root, recursive=True, choices={"one/notes.txt": "keep", "two/notes.txt": "skip"}
+        )
+        plan_path = self.save_payload(plan)
+        record = Path(self.apply(plan_path)["record"]["path"])
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Planned 2 files; the record covers 1.", stdout)
+        self.assertIn("1 was left alone on purpose.", stdout)
+        self.assertNotIn("never started", stdout)
+
+    def test_files_put_back_by_an_undo_are_not_called_unmoved(self):
+        self.write("a-first.txt", b"pretend first")
+        self.write("b-second.txt", b"pretend second")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        undone = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        undo_name = Path(undone["record"]["path"]).name
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("did not move", stdout)
+        self.assertIn(
+            f'[moved] "a-first.txt" -> "_organized/txt/a-first.txt" '
+            f'(put back at "a-first.txt" by the undo in "{undo_name}")',
+            stdout,
+        )
+        self.assertIn(
+            f'Undone since by "{undo_name}", which finished; its record confirms it moved 2 of '
+            "this run's 2 files out of the organised folder.",
+            stdout,
+        )
+        self.assertIn("Nothing is left to undo", stdout)
+        self.assertNotIn("--undo on this record would move", stdout)
+
+    def test_an_undo_given_a_relative_path_is_still_found(self):
+        self.write("a-first.txt", b"pretend first")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, cwd)
+        relative = Path("_organized", fileplan.JOURNAL_DIRECTORY, record.name)
+        self.run_cli(".", "--undo", str(relative))
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn("put back at \"a-first.txt\" by the undo in", stdout)
+
+    def test_a_cut_off_run_that_was_undone_reads_correctly(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], stop_before=False, at=2)
+        self.run_cli(str(self.root), "--undo", str(record))
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        # b.txt moved without its outcome being written; the undo put it back.
+        self.assertIn('[no outcome] "b.txt" -> "_organized/txt/b.txt" (put back at "b.txt"', stdout)
+        self.assertIn('[moved] "a.txt" -> "_organized/txt/a.txt" (put back at "a.txt"', stdout)
+        self.assertNotIn("did not move", stdout)
+
+    def test_a_file_with_no_outcome_is_never_said_to_have_stayed(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], at=2)
+        self.run_cli(str(self.root), "--undo", str(record))
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        # b.txt is at its original name, but no outcome was ever written for
+        # it, so being there is not taken as proof that it never moved.
+        self.assertIn(
+            '[no outcome] "b.txt" -> "_organized/txt/b.txt" (the file is at '
+            '"b.txt" now; the record has no outcome for it, so whether it moved '
+            "is not known)",
+            stdout,
+        )
+        self.assertNotIn("did not move", stdout)
+
+    def test_did_not_move_is_said_only_when_the_record_says_so(self):
+        self.write("a.txt", b"pretend a")
+        self.write("b.txt", b"pretend b")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        # Rewrite the record so it says b.txt was not moved, then put it back.
+        lines = record.read_text(encoding="utf-8").splitlines()
+        edited = []
+        for line in lines:
+            item = json.loads(line)
+            if item["record"] == "done" and item["source"] == "b.txt":
+                item["outcome"] = "not-moved"
+            edited.append(json.dumps(item))
+        record.write_text("\n".join(edited) + "\n", encoding="utf-8")
+        os.replace(self.root / "_organized" / "txt" / "b.txt", self.root / "b.txt")
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn(
+            '[not-moved] "b.txt" -> "_organized/txt/b.txt" (the file is still at '
+            '"b.txt"; the record says it did not move)',
+            stdout,
+        )
+
+    def test_a_moved_file_put_back_by_hand_is_not_called_unmoved(self):
+        self.write("a-first.txt", b"pretend first")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        landed = self.root / "_organized" / "txt" / "a-first.txt"
+        os.replace(landed, self.root / "a-first.txt")
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertNotIn("did not move", stdout)
+        self.assertIn(
+            'the file is back at "a-first.txt"; this run moved it, but no undo '
+            "record says it was put back",
+            stdout,
+        )
+
+    def test_the_json_report_names_the_undo(self):
+        self.write("a-first.txt", b"pretend first")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        undone = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+
+        _, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+
+        report = json.loads(stdout)
+        self.assertEqual(
+            report["undo_runs"],
+            [
+                {
+                    "record": undone["record"]["path"],
+                    "undoing": str(record),
+                    "depth": 1,
+                    "reverses": True,
+                    "direction": "out",
+                    "completed": True,
+                    "record_complete": True,
+                    "truncated": False,
+                    "stopped_at": None,
+                    "files": 1,
+                    "unconfirmed": 0,
+                    "no_outcome": 0,
+                }
+            ],
+        )
+        entry = report["entries"][0]
+        self.assertEqual(entry["undone_by"], undone["record"]["path"])
+        self.assertEqual(entry["undo_outcome"], "restored")
+
+    def undo_cut_off(self, record, at, stop_before=True):
+        """Undo a run and stop it dead partway, as an interruption would."""
+        real_rename = fileplan._rename_noreplace
+        calls = []
+
+        def rename(*args):
+            calls.append(args)
+            if len(calls) == at and stop_before:
+                raise KeyboardInterrupt
+            real_rename(*args)
+            if len(calls) == at and not stop_before:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
+            with self.assertRaises(KeyboardInterrupt):
+                fileplan.undo_record(fileplan.load_record(record), self.root, record)
+
+    def applied_four(self):
+        for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+            self.write(name, f"pretend {name}\n".encode())
+        return Path(self.apply(self.save_plan())["record"]["path"])
+
+    def test_an_undo_that_was_cut_off_is_not_called_done(self):
+        record = self.applied_four()
+        # Undo goes newest first: d, c, then stops before b.
+        self.undo_cut_off(record, at=3)
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("Undone since", stdout)
+        self.assertNotIn("Nothing is left to undo", stdout)
+        self.assertIn(
+            "but its record was never closed, so it did not finish; its record confirms it moved 2 of this run's 4 files out of the organised folder, and it was moving 1 more when it stopped, with no outcome written.",
+            stdout,
+        )
+        self.assertIn('[moved] "d.txt" -> "_organized/txt/d.txt" (put back at "d.txt"', stdout)
+        self.assertIn(
+            '[moved] "b.txt" -> "_organized/txt/b.txt" (the file is there now; the '
+            "undo in",
+            stdout,
+        )
+        self.assertIn("was cut off while moving it out of the organised folder)", stdout)
+        self.assertIn('[moved] "a.txt" -> "_organized/txt/a.txt" (the file is there now)\n', stdout)
+        self.assertIn("--undo on this record would move 2 files and leave 2 alone.", stdout)
+
+    def test_a_file_an_undo_moved_before_it_was_cut_off_is_found_put_back(self):
+        record = self.applied_four()
+        self.undo_cut_off(record, at=3, stop_before=False)
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        # b.txt moved back, but the undo died before it could confirm it.
+        self.assertIn(
+            '[moved] "b.txt" -> "_organized/txt/b.txt" (the file is at "b.txt"; the '
+            "undo in",
+            stdout,
+        )
+        self.assertIn("was cut off while moving it out of the organised folder, so that undo never confirmed it)", stdout)
+        self.assertIn("moved 2 of this run's 4 files out of the organised folder", stdout)
+        self.assertNotIn("Undone since", stdout)
+
+    def test_an_undo_that_stopped_early_says_where(self):
+        record = self.applied_four()
+        # Something takes c.txt's original name while the undo is running.
+        real_restore = fileplan._restore_one
+
+        def restore(root, entry):
+            if entry["source"] == "c.txt":
+                (self.root / "c.txt").write_bytes(b"pretend newcomer")
+            return real_restore(root, entry)
+
+        with mock.patch.object(fileplan, "_restore_one", side_effect=restore):
+            undone = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        self.assertFalse(undone["summary"]["completed"])
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn('but stopped early at "c.txt", so it did not finish', stdout)
+        self.assertIn("moved 1 of this run's 4 files out of the organised folder", stdout)
+        self.assertIn("the undo in", stdout)
+        self.assertIn("did not move it out of the organised folder)", stdout)
+        self.assertNotIn("Undone since", stdout)
+
+    def test_an_undo_whose_record_never_closed_is_not_reported_finished(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        real_write = fileplan._Journal.write
+
+        def write(journal, entry):
+            if entry["record"] == "end":
+                raise OSError(errno.EIO, "Input/output error")
+            real_write(journal, entry)
+
+        with mock.patch.object(fileplan._Journal, "write", write):
+            code, stdout, _ = self.run_cli(str(self.root), "--undo", str(record))
+
+        self.assertEqual(code, 1)
+        self.assertNotIn("Stopped at the end", stdout)
+        self.assertIn(
+            "Put back 1 of 1 files, but the record of this undo is not finished",
+            stdout,
+        )
+
+        _, shown, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertNotIn("Undone since", shown)
+        self.assertIn("but its record was never closed, so it did not finish; its record confirms it moved 1", shown)
+
+    def test_a_second_undo_does_not_hide_what_the_first_put_back(self):
+        record = self.applied_four()
+        self.undo_cut_off(record, at=3)  # puts back d and c, then is cut off
+        finished = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        second = Path(finished["record"]["path"]).name
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertNotIn("no undo record says", stdout)
+        self.assertIn("its record was never closed, so it did not finish; its record confirms it moved 2", stdout)
+        self.assertIn(f'Undone since by "{second}", which finished; its record confirms it moved 2', stdout)
+        self.assertIn(f'(put back at "a.txt" by the undo in "{second}")', stdout)
+        self.assertNotIn(f'(put back at "d.txt" by the undo in "{second}")', stdout)
+        self.assertIn('(put back at "d.txt" by the undo in', stdout)
+
+    RECORD_FACTS = (
+        "entries",
+        "planned",
+        "passed_over",
+        "never_started",
+        "no_outcome",
+        "recorded_moved",
+        "recorded_not_moved",
+        "recorded_unknown",
+        "record_complete",
+        "truncated",
+        "run_completed",
+        "stopped_at",
+    )
+
+    def summary(self, record):
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+        self.assertEqual(code, 0)
+        return json.loads(stdout)["summary"]
+
+    def test_undoing_a_run_leaves_every_recorded_count_untouched(self):
+        record = self.applied_four()
+        before = self.summary(record)
+        self.assertEqual(
+            {key: before[key] for key in ("recorded_moved", "at_destination", "put_back")},
+            {"recorded_moved": 4, "at_destination": 4, "put_back": 0},
+        )
+
+        fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        after = self.summary(record)
+
+        # What the record says happened cannot change; only where the files are.
+        self.assertEqual(
+            {key: before[key] for key in self.RECORD_FACTS},
+            {key: after[key] for key in self.RECORD_FACTS},
+        )
+        self.assertEqual(after["recorded_moved"], 4)
+        self.assertEqual(after["put_back"], 4)
+        self.assertEqual((after["at_destination"], after["at_source"]), (0, 4))
+
+    def test_every_entry_falls_into_exactly_one_recorded_count(self):
+        record = self.applied_four()
+        self.undo_cut_off(record, at=3)
+        summary = self.summary(record)
+
+        self.assertEqual(
+            summary["recorded_moved"]
+            + summary["recorded_not_moved"]
+            + summary["recorded_unknown"]
+            + summary["no_outcome"],
+            summary["entries"],
+        )
+
+    def test_the_counts_line_says_what_the_record_says_and_what_came_after(self):
+        record = self.applied_four()
+
+        _, before, _ = self.run_cli(str(self.root), "--show", str(record))
+        self.assertIn("The record confirms 4 of its 4 files moved.\n", before)
+
+        fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        _, after, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn(
+            "The record confirms 4 of its 4 files moved; since then undo records confirm 4 were moved back "
+            "out of the organised folder.",
+            after,
+        )
+
+    def test_a_partly_undone_run_counts_both_sides(self):
+        record = self.applied_four()
+        self.undo_cut_off(record, at=3)  # puts back d and c, then is cut off
+
+        summary = self.summary(record)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(summary["recorded_moved"], 4)
+        self.assertEqual(summary["put_back"], 2)
+        self.assertEqual(summary["back_without_undo"], 0)
+        self.assertIn(
+            "The record confirms 4 of its 4 files moved; since then undo records confirm 2 were moved back "
+            "out of the organised folder.",
+            stdout,
+        )
+
+    def test_a_file_put_back_by_hand_is_counted_apart_from_an_undo(self):
+        self.write("a-first.txt", b"pretend first")
+        self.write("b-second.txt", b"pretend second")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        os.replace(
+            self.root / "_organized" / "txt" / "a-first.txt", self.root / "a-first.txt"
+        )
+
+        summary = self.summary(record)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(summary["recorded_moved"], 2)
+        self.assertEqual((summary["put_back"], summary["back_without_undo"]), (0, 1))
+        self.assertIn(
+            "The record confirms 2 of its 2 files moved; since then 1 is back with "
+            "no undo record to say why.",
+            stdout,
+        )
+
+    def test_an_unknown_outcome_is_never_counted_as_moved(self):
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.write(name, f"pretend {name}\n".encode())
+        plan_path = self.save_plan()
+        real_rename = fileplan._rename_noreplace
+        calls = []
+
+        def rename(*args):
+            calls.append(args)
+            if len(calls) == 2:
+                raise RuntimeError("something unrecognised went wrong")
+            real_rename(*args)
+
+        with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
+            report = self.apply(plan_path)
+        record = Path(report["record"]["path"])
+
+        summary = self.summary(record)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(summary["recorded_moved"], 1)
+        self.assertEqual(summary["recorded_unknown"], 1)
+        self.assertEqual(summary["back_without_undo"], 0)
+        self.assertIn(
+            "The record confirms 1 of its 2 files moved, and 1 could not be told "
+            "either way.",
+            stdout,
+        )
+        # The run could not tell, so neither does this: no claim either way.
+        self.assertIn(
+            '[unknown] "b.txt" -> "_organized/txt/b.txt" (the file is at "b.txt"; '
+            "this run could not tell whether it moved, and nothing since says either)",
+            stdout,
+        )
+        self.assertNotIn("this run moved it", stdout)
+
+    def show_json(self, record):
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+        self.assertEqual(code, 0)
+        return json.loads(stdout)
+
+    def undo_cli(self, record):
+        code, stdout, stderr = self.run_cli(str(self.root), "--undo", str(record))
+        self.assertEqual(code, 0, stderr)
+        return Path(next(
+            line.split('"')[1] for line in stdout.splitlines() if line.startswith("Record: ")
+        ))
+
+    def assert_history_only_grows(self, record, steps):
+        """Run each step, and check nothing already reported ever changes."""
+        seen_runs: list[dict] = []
+        first = self.show_json(record)["summary"]
+        for step in steps:
+            step()
+            report = self.show_json(record)
+            # The record's own account never moves.
+            self.assertEqual(
+                {key: report["summary"][key] for key in self.RECORD_FACTS},
+                {key: first[key] for key in self.RECORD_FACTS},
+            )
+            # Every run already reported is reported exactly as before; new
+            # runs are only added after them.
+            self.assertEqual(report["undo_runs"][: len(seen_runs)], seen_runs)
+            seen_runs = report["undo_runs"]
+            for run in seen_runs:
+                self.assertEqual(run["files"], 4)
+        return seen_runs
+
+    def test_undo_redo_undo_again_never_changes_an_earlier_count(self):
+        record = self.applied_four()
+        made = {}
+
+        def undo():
+            made["undo"] = self.undo_cli(record)
+
+        def redo():
+            made["redo"] = self.undo_cli(made["undo"])
+
+        runs = self.assert_history_only_grows(record, [undo, redo, undo])
+
+        self.assertEqual([run["direction"] for run in runs], ["out", "in", "out"])
+        summary = self.show_json(record)["summary"]
+        self.assertEqual((summary["put_back"], summary["moved_again"]), (4, 4))
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+        self.assertEqual(stdout.count("it moved 4 of this run's 4 files out of the organised folder"), 2)
+        self.assertIn("it moved 4 of this run's 4 files into the organised folder", stdout)
+
+    def test_undoing_a_redo_works_and_is_counted(self):
+        record = self.applied_four()
+        made = {}
+
+        def undo():
+            made["undo"] = self.undo_cli(record)
+
+        def redo():
+            made["redo"] = self.undo_cli(made["undo"])
+
+        def undo_the_redo():
+            made["again"] = self.undo_cli(made["redo"])
+
+        def redo_again():
+            made["again2"] = self.undo_cli(made["again"])
+
+        runs = self.assert_history_only_grows(
+            record, [undo, redo, undo_the_redo, redo_again]
+        )
+
+        self.assertEqual([run["depth"] for run in runs], [1, 2, 3, 4])
+        self.assertEqual(
+            [run["direction"] for run in runs], ["out", "in", "out", "in"]
+        )
+        self.assertEqual(
+            sorted(path.name for path in self.root.glob("*.txt")), []
+        )
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+        self.assertIn(
+            f'"{made["redo"].name}" was itself undone by "{made["again"].name}", '
+            "which finished; its record confirms it moved 4 of this run's 4 files out of the organised folder.",
+            stdout,
+        )
+
+    def test_a_redo_record_can_be_looked_at(self):
+        record = self.applied_four()
+        undo = self.undo_cli(record)
+        redo = self.undo_cli(undo)
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(redo))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("From undoing \"run-", stdout)
+        self.assertIn("The record confirms 4 of its 4 files moved.", stdout)
+
+    def test_an_undo_record_that_moves_files_both_ways_is_refused(self):
+        record = self.applied_four()
+        undo = self.undo_cli(record)
+        lines = undo.read_text(encoding="utf-8").splitlines()
+        edited = []
+        flipped = False
+        for line in lines:
+            item = json.loads(line)
+            if item["record"] == "intent" and not flipped:
+                item["source"], item["destination"] = item["destination"], item["source"]
+                flipped = True
+            edited.append(json.dumps(item))
+        undo.write_text("\n".join(edited) + "\n", encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--undo", str(undo))
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("every file in an undo record must move the same way", stderr)
+
+    def test_an_undo_record_says_it_moved_files_out(self):
+        record = self.applied_four()
+        undo = self.undo_cli(record)
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(undo))
+        report = self.show_json(undo)
+
+        self.assertIn(f'From undoing "{record.name}" in', stdout)
+        self.assertIn("It set out to move files out of the organised folder.", stdout)
+        self.assertEqual(report["moves"], "out")
+
+    def test_an_applied_run_says_it_moved_files_in(self):
+        record = self.applied_four()
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn("It set out to move files into the organised folder.", stdout)
+        self.assertEqual(self.show_json(record)["moves"], "in")
+
+    def test_undoing_an_undo_record_is_reported_as_moving_files_in(self):
+        record = self.applied_four()
+        undo = self.undo_cli(record)
+        redo = self.undo_cli(undo)
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(undo))
+        report = self.show_json(undo)
+
+        # The files are in the organised folder now, and the report says so.
+        self.assertEqual(sorted(p.name for p in self.root.glob("*.txt")), [])
+        self.assertEqual(
+            [(r["depth"], r["reverses"], r["direction"]) for r in report["undo_runs"]],
+            [(1, True, "in")],
+        )
+        self.assertIn(
+            f'Undone since by "{redo.name}", which finished; its record confirms it moved 4 of this '
+            "run's 4 files into the organised folder.",
+            stdout,
+        )
+        self.assertIn(
+            "since then undo records confirm 4 were moved back into the organised folder.", stdout
+        )
+        self.assertIn(
+            "Nothing is left to undo: every file is back where this run found it, "
+            "in the organised folder.",
+            stdout,
+        )
+        self.assertNotIn("original name.", stdout)
+        self.assertNotIn("out of the organised folder by an undo", stdout)
+
+    def test_directions_alternate_correctly_down_a_chain_from_an_undo_record(self):
+        record = self.applied_four()
+        undo = self.undo_cli(record)
+        redo = self.undo_cli(undo)
+        again = self.undo_cli(redo)
+
+        report = self.show_json(undo)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(undo))
+
+        self.assertEqual(
+            [(r["depth"], r["reverses"], r["direction"]) for r in report["undo_runs"]],
+            [(1, True, "in"), (2, False, "out")],
+        )
+        self.assertIn(
+            f'"{redo.name}" was itself undone by "{again.name}", which finished; its record confirms it '
+            "moved 4 of this run's 4 files out of the organised folder.",
+            stdout,
+        )
+        # From the apply record the same runs read the other way round.
+        from_apply = self.show_json(record)
+        self.assertEqual(
+            [(r["reverses"], r["direction"]) for r in from_apply["undo_runs"]],
+            [(True, "out"), (False, "in"), (True, "out")],
+        )
+
+    def test_the_header_never_claims_a_move_that_was_not_confirmed(self):
+        for name in ("a.txt", "b.txt"):
+            self.write(name, f"pretend {name}\n".encode())
+        plan_path = self.save_plan()
+
+        # The very first move fails in a way the run cannot read.
+        with mock.patch.object(
+            fileplan, "_rename_noreplace", side_effect=RuntimeError("unrecognised")
+        ):
+            record = Path(self.apply(plan_path)["record"]["path"])
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn("It set out to move files into the organised folder.", stdout)
+        self.assertNotIn("It moved", stdout)
+        self.assertIn("The record confirms 0 of its 1 files moved", stdout)
+
+    def test_a_move_that_was_not_confirmed_is_counted_apart(self):
+        for name in ("a-first.txt", "b-second.txt"):
+            self.write(name, b"pretend contents")
+        plan_path = self.save_plan()
+        real_rename = fileplan._rename_noreplace
+        calls = []
+
+        def rename(*args):
+            calls.append(args)
+            real_rename(*args)
+            if len(calls) == 2:
+                landed = self.root / "_organized/txt/b-second.txt"
+                with landed.open("ab") as handle:
+                    handle.write(b" plus a late addition")
+
+        with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
+            record = Path(self.apply(plan_path)["record"]["path"])
+        summary = self.summary(record)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(
+            (summary["recorded_moved"], summary["recorded_moved_unconfirmed"]), (2, 1)
+        )
+        self.assertIn(
+            "The record confirms 1 of its 2 files moved, and 1 moved but could not "
+            "be confirmed.",
+            stdout,
+        )
+
+    def test_an_undo_is_credited_only_with_the_moves_it_confirmed(self):
+        record = self.applied_four()
+        real_confirm = fileplan._confirm_at_original
+        calls = []
+
+        def confirm(root, entry):
+            calls.append(entry["source"])
+            if len(calls) == 2:
+                return "pretend the look afterwards found a problem"
+            return real_confirm(root, entry)
+
+        with mock.patch.object(fileplan, "_confirm_at_original", side_effect=confirm):
+            undone = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        self.assertEqual(undone["summary"]["restored_unconfirmed"], 1)
+        report = self.show_json(record)
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        run = report["undo_runs"][0]
+        self.assertEqual((run["files"], run["unconfirmed"]), (1, 1))
+        self.assertEqual(report["summary"]["put_back"], 1)
+        self.assertIn(
+            "its record confirms it moved 1 of this run's 4 files out of the "
+            "organised folder, and 1 more it could not confirm.",
+            stdout,
+        )
+        self.assertIn("undo records confirm 1 was moved back", stdout)
+        self.assertIn(
+            'recorded moving it out of the organised folder but could not confirm it)',
+            stdout,
+        )
+
+    def test_a_redo_is_credited_with_moving_a_file_back_in(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        undone = fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        redo = Path(undone["record"]["path"])
+        redone = fileplan.undo_record(fileplan.load_record(redo), self.root, redo)
+        redo_name = Path(redone["record"]["path"]).name
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn(
+            f'(the file is there now; the undo in "{redo_name}" moved it here again)',
+            stdout,
+        )
+        self.assertIn(
+            f'"{redo.name}" was itself undone by "{redo_name}", which finished; its record confirms it '
+            "moved 1 of this run's 1 files into the organised folder.",
+            stdout,
+        )
+
+    def test_a_put_back_file_moved_again_with_no_record_is_said_so(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        fileplan.undo_record(fileplan.load_record(record), self.root, record)
+        os.replace(
+            self.root / "tidy-me.txt", self.root / "_organized" / "txt" / "tidy-me.txt"
+        )
+
+        _, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertIn("(the file is there now; the undo in", stdout)
+        self.assertIn("moved it out of the organised folder, but it has been moved here again since)", stdout)
+
+    def test_an_undo_record_says_it_came_from_an_undo(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        applied = Path(self.apply(self.save_plan())["record"]["path"])
+        undone = fileplan.undo_record(
+            fileplan.load_record(applied), self.root, applied
+        )
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(undone["record"]["path"])
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("From undoing \"run-", stdout)
+        self.assertIn('[restored] "_organized/txt/tidy-me.txt" -> "tidy-me.txt"', stdout)
+
+    def test_strict_fails_only_while_something_is_unsettled(self):
+        self.write("a-first.txt", b"pretend first")
+        self.write("b-second.txt", b"pretend second")
+        finished = Path(self.apply(self.save_plan())["record"]["path"])
+
+        code, _, _ = self.run_cli(str(self.root), "--show", str(finished), "--strict")
+        self.assertEqual(code, 0)
+
+        for name in ("a-first.txt", "b-second.txt"):
+            (self.root / "_organized" / "txt" / name).rename(self.root / name)
+        cut_off = self.cut_off_run(["c.txt", "d.txt"], at=2)
+
+        code, _, _ = self.run_cli(str(self.root), "--show", str(cut_off), "--strict")
+        self.assertEqual(code, 1)
+
+    def test_the_json_report_carries_the_same_facts(self):
+        record = self.cut_off_run(["a.txt", "b.txt", "c.txt"], at=2)
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+
+        report = json.loads(stdout)
+        self.assertEqual((code, report["kind"], report["run"]), (0, "run", "apply"))
+        self.assertEqual(report["cut_off_at"], "b.txt")
+        self.assertEqual(report["outcomes"], {"moved": 1, "no-outcome": 1})
+        self.assertEqual(
+            [(e["source"], e["recorded"], e["where"], e["undo"]) for e in report["entries"]],
+            [
+                ("a.txt", "moved", "destination", "would-move"),
+                ("b.txt", None, "source", "nothing-to-do"),
+            ],
+        )
+        self.assertEqual(
+            report["summary"],
+            {
+                "entries": 2,
+                "planned": 3,
+                "passed_over": 0,
+                "never_started": 1,
+                "no_outcome": 1,
+                "recorded_moved": 1,
+                "recorded_moved_unconfirmed": 0,
+                "recorded_not_moved": 0,
+                "recorded_unknown": 0,
+                "put_back": 0,
+                "moved_again": 0,
+                "back_without_undo": 0,
+                "at_destination": 1,
+                "at_source": 1,
+                "unclear": 0,
+                "record_complete": False,
+                "truncated": False,
+                "run_completed": None,
+                "stopped_at": None,
+                "undo_possible": True,
+            },
+        )
+
+    def test_a_record_from_another_folder_is_refused(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        elsewhere = self.make_outside_folder()
+
+        code, stdout, stderr = self.run_cli(str(elsewhere), "--show", str(record))
+
+        self.assertEqual((code, stdout), (2, ""))
+        self.assertIn("The record was made for", stderr)
+
+    def test_an_unfinished_last_line_is_reported(self):
+        record = self.cut_off_run(["a.txt", "b.txt"], at=2)
+        with record.open("a", encoding="utf-8") as handle:
+            handle.write('{"record": "intent", "ti')
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertIn("ends with an unfinished line", stdout)
+
+    def test_show_is_refused_alongside_anything_that_changes_files(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+
+        for extra in (
+            ("--apply",),
+            ("--undo", str(record)),
+            ("--resolve",),
+            ("--recursive",),
+            ("--check-duplicates",),
+        ):
+            with self.subTest(extra=extra[0]):
+                code, stdout, stderr = self.run_cli(
+                    str(self.root), "--show", str(record), *extra
+                )
+
+                self.assertEqual((code, stdout), (2, ""))
+                self.assertIn(f"remove {extra[0]}", stderr)
+
+
+class TerminalTextTests(unittest.TestCase):
+    """Names in plain output can be copied straight back into a command."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+
+    def test_emoji_and_joined_emoji_are_printed_as_they_are(self):
+        for name in ("a 🍎.txt", "family 👨\u200d👩\u200d👧\u200d👦.md", "heart ❤\ufe0f.txt", "café"):
+            with self.subTest(name=name):
+                self.assertEqual(fileplan._quote(name), f'"{name}"')
+
+    def test_what_cannot_be_shown_safely_is_escaped(self):
+        cases = {
+            "new\nline": '"new\\nline"',
+            "tab\there": '"tab\\there"',
+            "bell\x07": '"bell\\u0007"',
+            # A right-to-left override could make one name read as another.
+            "invoice\u202efdp.exe": '"invoice\\u202efdp.exe"',
+            # Bytes that were not valid text in the filename's encoding.
+            "bad\udc80byte": '"bad\\udc80byte"',
+            'say "hi"': '"say \\"hi\\""',
+        }
+        for name, expected in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(fileplan._quote(name), expected)
+                # An escaped name reads back exactly as JSON.
+                self.assertEqual(json.loads(fileplan._quote(name)), name)
+
+    def test_a_backslash_is_a_separator_on_windows_and_escaped_elsewhere(self):
+        with mock.patch.object(fileplan.os, "sep", "\\"):
+            self.assertEqual(
+                fileplan._quote("C:\\Users\\you\\inbox 📥"), '"C:\\Users\\you\\inbox 📥"'
+            )
+        with mock.patch.object(fileplan.os, "sep", "/"):
+            self.assertEqual(fileplan._quote("back\\slash"), '"back\\\\slash"')
+
+    def run_through(self, stream, *args):
+        with mock.patch.object(fileplan.sys, "stdout", stream), mock.patch.object(
+            fileplan.sys, "stderr", io.StringIO()
+        ):
+            return fileplan.main(list(args))
+
+    def test_a_pipe_in_a_local_code_page_gets_utf8(self):
+        (self.root / "a 🍎.txt").write_bytes(b"pretend apple")
+        raw = io.BytesIO()
+        # What a Windows pipe or redirect looks like: cp1252 has no emoji.
+        pipe = io.TextIOWrapper(raw, encoding="cp1252", newline="")
+        environment = {k: v for k, v in os.environ.items() if k != "PYTHONIOENCODING"}
+
+        with mock.patch.dict(fileplan.os.environ, environment, clear=True):
+            code = self.run_through(pipe, str(self.root))
+        pipe.flush()
+
+        self.assertEqual(code, 0)
+        text = raw.getvalue().decode("utf-8")
+        self.assertIn('"a 🍎.txt" -> "_organized/txt/a 🍎.txt"', text)
+        self.assertNotIn("\\U0001f34e", text)
+
+    def test_pythonioencoding_is_left_to_decide(self):
+        (self.root / "a 🍎.txt").write_bytes(b"pretend apple")
+        raw = io.BytesIO()
+        pipe = io.TextIOWrapper(raw, encoding="cp1252", newline="")
+
+        with mock.patch.dict(fileplan.os.environ, {"PYTHONIOENCODING": "cp1252"}):
+            self.run_through(pipe, str(self.root))
+        pipe.flush()
+
+        self.assertIn(b"\\U0001f34e", raw.getvalue())
+
+    def test_a_record_path_printed_by_undo_can_be_pasted_back_in(self):
+        if not fileplan._SAFE_MOVE_SUPPORTED:
+            self.skipTest("needs directory handles and hard links")
+        folder = self.root / "inbox 📥 ✨"
+        folder.mkdir()
+        (folder / "a 🍎.txt").write_bytes(b"pretend apple")
+        plan = fileplan.build_plan(folder)
+        applied = fileplan.apply_plan(plan, folder)
+        record = applied["record"]["path"]
+        stdout = io.StringIO()
+
+        with mock.patch.object(fileplan.sys, "stdout", stdout), mock.patch.object(
+            fileplan.sys, "stderr", io.StringIO()
+        ):
+            fileplan.main([str(folder), "--undo", record])
+        printed = next(
+            line for line in stdout.getvalue().splitlines() if line.startswith("Record: ")
+        )
+        # The printed path, quotes stripped, is the real path: paste it back in.
+        pasted = printed[len("Record: "):][1:-1]
+
+        self.assertTrue(Path(pasted).is_file(), pasted)
+        self.assertEqual(fileplan.load_record(Path(pasted))["kind"], "undo")
 
 
 if __name__ == "__main__":
