@@ -108,5 +108,11 @@ Names in plain output are printed exactly as they are, emoji and Windows
 backslashes included, and pipes and files get UTF-8, so a printed path can be
 pasted back into the next command.
 
+A record that cannot be read is named in the report with the reason instead of
+being silently passed over, and while any record in the folder is unreadable
+the report says its history may be incomplete rather than claiming no undo
+record exists. A record malformed in any way is refused with a message saying
+what is wrong, never a crash.
+
 The remaining estimate is **2-3 hours**. These are proposed next steps, not
 claims about past development time or a release schedule.

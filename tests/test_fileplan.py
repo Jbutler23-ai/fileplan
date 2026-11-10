@@ -2150,6 +2150,18 @@ class UndoTests(_ApplyFixture):
             "done with no intent": "\n".join(
                 [good[0], json.dumps({"record": "done", "index": 7, "outcome": "moved"})]
             ),
+            "a list for a done index": "\n".join(
+                good[:2]
+                + [json.dumps({"record": "done", "index": [0], "outcome": "moved"})]
+            ),
+            "a dict for a done outcome": "\n".join(
+                good[:2]
+                + [json.dumps({"record": "done", "index": 0, "outcome": {"x": 1}})]
+            ),
+            "a true for a done index": "\n".join(
+                good[:2]
+                + [json.dumps({"record": "done", "index": True, "outcome": "moved"})]
+            ),
         }
         for label, payload in payloads.items():
             with self.subTest(payload=label):
@@ -3891,6 +3903,93 @@ class RunInspectionTests(_ApplyFixture):
         self.assertIn(second.name, stdout)
         self.assertNotIn(first.name, stdout)
 
+    def test_a_record_with_odd_fields_is_refused_or_shown_never_a_crash(self):
+        """Any malformed record gets a clear answer, not a traceback."""
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        good = record.read_text().splitlines()
+        start = json.loads(good[0])
+        payloads = {
+            "a list for a kind": [json.dumps(dict(start, kind=["apply"]))] + good[1:],
+            "a number for a plan": [json.dumps(dict(start, plan=123))] + good[1:],
+            "a list for a done index": good[:2]
+            + [json.dumps({"record": "done", "index": [0], "outcome": "moved"})],
+            "a dict for a done outcome": good[:2]
+            + [json.dumps({"record": "done", "index": 0, "outcome": {"x": 1}})],
+        }
+        for label, lines in payloads.items():
+            with self.subTest(payload=label):
+                record.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                code, stdout, stderr = self.run_cli(
+                    str(self.root), "--show", str(record)
+                )
+                self.assertIn(code, (0, 2))
+                self.assertNotIn("Traceback", stderr)
+                if code == 0:
+                    self.assertIn("Look only. No files were changed.", stdout)
+                else:
+                    self.assertEqual(stdout, "")
+                    self.assertIn("is not a usable record", stderr)
+
+    def test_an_unreadable_record_is_named_not_passed_over(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        code, _, _ = self.run_cli(str(self.root), "--undo", str(record))
+        self.assertEqual(code, 0)
+        undo = next(path for path in self.record_files() if path != record)
+        undo.write_text("{broken\n", encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            f'"{undo}" could not be used: it does not begin with a start record.',
+            stdout,
+        )
+        self.assertIn("Later runs may therefore be missing", stdout)
+        # The file was put back, but the record saying so cannot be read, so
+        # the report must not claim that no undo record exists.
+        self.assertIn("no readable undo record says it was put back", stdout)
+        self.assertIn("back with no readable undo record to say why", stdout)
+        self.assertNotIn("no undo record says", stdout)
+        self.assertNotIn("no undo record to say why", stdout)
+
+    def test_the_json_report_names_unreadable_records(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        code, _, _ = self.run_cli(str(self.root), "--undo", str(record))
+        self.assertEqual(code, 0)
+        undo = next(path for path in self.record_files() if path != record)
+        undo.write_bytes(b"\xff\xfe not text")
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+
+        self.assertEqual(code, 0)
+        report = json.loads(stdout)
+        self.assertEqual(
+            [item["record"] for item in report["unreadable_records"]], [str(undo)]
+        )
+        self.assertIn("not readable text", report["unreadable_records"][0]["problem"])
+        self.assertFalse(report["summary"]["history_complete"])
+        # The undone run cannot be counted, so nothing claims the file was put back.
+        self.assertEqual(report["undo_runs"], [])
+        self.assertEqual(report["summary"]["put_back"], 0)
+
+    def test_a_readable_history_is_not_warned_about(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        code, _, _ = self.run_cli(str(self.root), "--undo", str(record))
+        self.assertEqual(code, 0)
+
+        code, stdout, _ = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("could not be used", stdout)
+        self.assertNotIn("may therefore be missing", stdout)
+        self.assertNotIn("readable undo record", stdout)
+
     def test_a_folder_with_no_records_says_so(self):
         self.write("tidy-me.txt", b"pretend contents")
 
@@ -4700,6 +4799,7 @@ class RunInspectionTests(_ApplyFixture):
                 "run_completed": None,
                 "stopped_at": None,
                 "undo_possible": True,
+                "history_complete": True,
             },
         )
 
