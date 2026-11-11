@@ -2725,7 +2725,7 @@ _RECORD_SAYS_MOVED = frozenset(
 _RECORD_SAYS_STAYED = frozenset({"not-moved", "not-restored"})
 
 
-def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict]]:
+def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict], list[dict]]:
     """Find every undo that follows from a record, at any depth, oldest first.
 
     An undo of the record puts its files back; an undo of that undo (a redo)
@@ -2744,23 +2744,35 @@ def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict]]:
     with the reason. One of those could be an undo of the shown record, so a
     report built from the first list is incomplete whenever the second is not
     empty, and has to say so rather than claim no undo record exists.
+
+    The third list names every readable undo in the folder whose chain of
+    undone records cannot be traced to a readable run: somewhere above it sits
+    a record that cannot be read, a record that is no longer in the folder, or
+    a loop. Such a run may follow from the shown record, so it is named with
+    what broke the trace rather than silently left out, but nothing is
+    credited from it, since its place in the chain would be a guess.
     """
     folder = root / DESTINATION_NAME / JOURNAL_DIRECTORY
     unreadable: list[dict] = []
     try:
         names = sorted(name for name in _list_names(folder) if name.endswith(".jsonl"))
     except FileNotFoundError:
-        return [], []
+        return [], [], []
     except OSError as error:
-        return [], [
-            {
-                "record": str(folder),
-                "problem": (
-                    "the folder of run records cannot be listed: "
-                    f"{error.strerror or error}"
-                ),
-            }
-        ]
+        return (
+            [],
+            [
+                {
+                    "record": str(folder),
+                    "problem": (
+                        "the folder of run records cannot be listed: "
+                        f"{error.strerror or error}"
+                    ),
+                }
+            ],
+            [],
+        )
+    loaded: dict[str, tuple[str, dict] | None] = {}
     children: dict[str, list[tuple[str, dict]]] = {}
     for name in names:
         try:
@@ -2769,7 +2781,9 @@ def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict]]:
             unreadable.append(
                 {"record": str(folder / name), "problem": error.detail or str(error)}
             )
+            loaded[os.path.normcase(name)] = None
             continue
+        loaded[os.path.normcase(name)] = (name, other)
         # An undo record always names what it undid; load_record refuses one
         # that does not, so no undo can be passed over here for a bad field.
         if other["kind"] != "undo":
@@ -2819,7 +2833,52 @@ def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict]]:
             )
             pending.append((name, depth + 1))
     found.sort(key=lambda run: Path(run["record"]).name)
-    return found, unreadable
+
+    # A readable undo not placed above sits in some other record's chain. That
+    # is only known when every link from it up to a readable root can be
+    # followed; a link that cannot be read, is gone, or loops leaves the run's
+    # relation to the shown record unknown, and unknown is reported, not
+    # dropped. A run in the shown chain is never here: its parent is in "seen",
+    # so the walk down already placed it.
+    unplaced = []
+    for key in sorted(loaded):
+        value = loaded[key]
+        if value is None:
+            continue
+        name, other = value
+        if other["kind"] != "undo" or key in seen:
+            continue
+        trail = {key}
+        link_name = Path(other["undoing"]).name
+        problem = broken = None
+        while True:
+            link = os.path.normcase(link_name)
+            if link in trail:
+                problem = "its chain of undone records loops"
+                break
+            trail.add(link)
+            if link not in loaded:
+                problem, broken = "is not among the records in the folder", link_name
+                break
+            above = loaded[link]
+            if above is None:
+                problem, broken = "cannot be read", link_name
+                break
+            if above[1]["kind"] != "undo":
+                break  # It traces whole to another readable run.
+            link_name = Path(above[1]["undoing"]).name
+        if problem:
+            unplaced.append(
+                {
+                    "record": str(folder / name),
+                    "undoing": str(folder / Path(other["undoing"]).name),
+                    "direction": _moves(other["entries"]),
+                    "completed": bool(other["complete"] and other["run_completed"]),
+                    "broken_link": str(folder / broken) if broken else None,
+                    "problem": problem,
+                }
+            )
+    return found, unreadable, unplaced
 
 
 def _moves(entries: list[dict]) -> str | None:
@@ -2895,7 +2954,7 @@ def inspect_run(record: dict, root: Path, record_path: Path | None = None) -> di
     # the same way for a run that applied a plan and one that undid it.
     where = {"restore": "destination", "skip": "source", "blocked": "unclear"}
     shown = str(record_path) if record_path is not None else record["path"]
-    later, unreadable = _later_runs(Path(shown).name, root_path)
+    later, unreadable, unplaced = _later_runs(Path(shown).name, root_path)
     # Which way the shown run moved its files. An apply always moves them in;
     # an undo moves them whichever way its entries say.
     moves = _moves(entries) or ("in" if record["kind"] == "apply" else None)
@@ -3044,6 +3103,11 @@ def inspect_run(record: dict, root: Path, record_path: Path | None = None) -> di
         # of them could be an undo of this run, so while this list is not
         # empty nothing here may claim that no undo record accounts for a file.
         "unreadable_records": unreadable,
+        # Readable undos whose chain of undone records cannot be traced to a
+        # readable run, with what broke the trace. Any of them could follow
+        # from this run, but crediting one would be a guess, so they are named
+        # here and counted nowhere.
+        "unplaced_runs": unplaced,
         "root": str(root_path),
         "plan": record["plan"],
         "started": record["started"],
@@ -3077,9 +3141,10 @@ def inspect_run(record: dict, root: Path, record_path: Path | None = None) -> di
             "run_completed": record["run_completed"],
             "stopped_at": record["stopped_at"],
             "undo_possible": counts["unclear"] == 0,
-            # False when a record in the folder could not be read, so the
-            # later runs shown here may not be all of them.
-            "history_complete": not unreadable,
+            # False when a record in the folder could not be read or an undo
+            # could not be traced, so the later runs shown here may not be all
+            # of them.
+            "history_complete": not unreadable and not unplaced,
         },
     }
 
@@ -3153,8 +3218,8 @@ def _where_note(item: dict, source: str, history_complete: bool = True) -> str:
     Never contradicts the record: a file is only said not to have moved when
     the record says so, and a file with no recorded outcome is never said to
     have stayed put. Directions are physical, from the later run's own entries.
-    When a record in the folder could not be read, no undo record is only
-    claimed of the readable ones.
+    While any record in the folder cannot be read or cannot be traced, no
+    undo record is claimed only of the known ones.
     """
     name = _quote(Path(item["undo_record"]).name) if item["undo_record"] else None
     direction = item["undo_direction"]
@@ -3180,10 +3245,10 @@ def _where_note(item: dict, source: str, history_complete: bool = True) -> str:
             return f"the file is at {source}; the undo in {name} {note}"
         if item["recorded"] in _RECORD_SAYS_MOVED:
             # The record says it moved, so never claim it did not.
-            readable = "" if history_complete else "readable "
+            known = "" if history_complete else "known "
             return (
                 f"the file is back at {source}; this run moved it, but no "
-                f"{readable}undo record says it was put back"
+                f"{known}undo record says it was put back"
             )
         if item["recorded"] in _RECORD_SAYS_STAYED:
             return f"the file is still at {source}; the record says it did not move"
@@ -3248,9 +3313,9 @@ def _record_account(summary: dict, moves: str | None = None) -> str:
         )
     if summary["back_without_undo"]:
         count = summary["back_without_undo"]
-        readable = "" if summary.get("history_complete", True) else "readable "
+        known = "" if summary.get("history_complete", True) else "known "
         since.append(
-            f"{count} {'is' if count == 1 else 'are'} back with no {readable}"
+            f"{count} {'is' if count == 1 else 'are'} back with no {known}"
             "undo record to say why"
         )
     if not since:
@@ -3305,10 +3370,21 @@ def _plain_run_output(report: dict) -> str:
         )
     for item in report["unreadable_records"]:
         lines.append(f"{_quote(item['record'])} could not be used: {item['problem']}.")
-    if report["unreadable_records"]:
+    for run in report["unplaced_runs"]:
+        what = (
+            f"{_quote(Path(run['broken_link']).name)} {run['problem']}"
+            if run["broken_link"]
+            else run["problem"]
+        )
+        lines.append(
+            f"{_quote(Path(run['record']).name)} undid "
+            f"{_quote(Path(run['undoing']).name)}, but {what}, so whether it "
+            "follows from this run is not known."
+        )
+    if report["unreadable_records"] or report["unplaced_runs"]:
         lines.append(
             "Later runs may therefore be missing from this report, and a file "
-            "can have been put back by a run whose record cannot be read."
+            "can have been put back by a run this report cannot account for."
         )
     if summary["planned"] is not None:
         covered = (

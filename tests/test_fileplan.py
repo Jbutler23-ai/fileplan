@@ -3964,8 +3964,8 @@ class RunInspectionTests(_ApplyFixture):
         self.assertIn("Later runs may therefore be missing", stdout)
         # The file was put back, but the record saying so cannot be read, so
         # the report must not claim that no undo record exists.
-        self.assertIn("no readable undo record says it was put back", stdout)
-        self.assertIn("back with no readable undo record to say why", stdout)
+        self.assertIn("no known undo record says it was put back", stdout)
+        self.assertIn("back with no known undo record to say why", stdout)
         self.assertNotIn("no undo record says", stdout)
         self.assertNotIn("no undo record to say why", stdout)
 
@@ -4012,7 +4012,7 @@ class RunInspectionTests(_ApplyFixture):
             stdout,
         )
         self.assertIn("Later runs may therefore be missing", stdout)
-        self.assertIn("no readable undo record says it was put back", stdout)
+        self.assertIn("no known undo record says it was put back", stdout)
         self.assertNotIn("no undo record says", stdout)
 
         code, stdout, _ = self.run_cli(
@@ -4023,6 +4023,104 @@ class RunInspectionTests(_ApplyFixture):
             [item["record"] for item in report["unreadable_records"]], [str(undo)]
         )
         self.assertFalse(report["summary"]["history_complete"])
+
+    def undo_chain(self, depth):
+        """Apply a plan, then undo, redo, and so on; return every record path."""
+        self.write("tidy-me.txt", b"pretend contents")
+        chain = [Path(self.apply(self.save_plan())["record"]["path"])]
+        for _ in range(depth):
+            code, _, _ = self.run_cli(str(self.root), "--undo", str(chain[-1]))
+            self.assertEqual(code, 0)
+            chain.append(
+                next(path for path in self.record_files() if path not in chain)
+            )
+        return chain
+
+    def test_a_redo_behind_an_unreadable_undo_is_named_not_skipped(self):
+        """An unreadable link must not quietly drop the readable runs below it."""
+        applied, undo, redo = self.undo_chain(2)
+        lines = undo.read_text().splitlines()
+        lines[0] = json.dumps(dict(json.loads(lines[0]), kind="restore"))
+        undo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(applied))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            f'"{redo.name}" undid "{undo.name}", but "{undo.name}" cannot be '
+            "read, so whether it follows from this run is not known.",
+            stdout,
+        )
+        self.assertIn("Later runs may therefore be missing", stdout)
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(applied), "--format", "json"
+        )
+        report = json.loads(stdout)
+        self.assertEqual(report["undo_runs"], [])
+        self.assertFalse(report["summary"]["history_complete"])
+        self.assertEqual(
+            [(Path(run["record"]).name, Path(run["undoing"]).name,
+              Path(run["broken_link"]).name, run["problem"], run["direction"])
+             for run in report["unplaced_runs"]],
+            [(redo.name, undo.name, undo.name, "cannot be read", "in")],
+        )
+
+    def test_runs_behind_a_missing_record_are_named_not_skipped(self):
+        applied, undo, redo, again = self.undo_chain(3)
+        undo.unlink()
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(applied))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            f'"{redo.name}" undid "{undo.name}", but "{undo.name}" is not among '
+            "the records in the folder, so whether it follows from this run is "
+            "not known.",
+            stdout,
+        )
+        self.assertIn(
+            f'"{again.name}" undid "{redo.name}", but "{undo.name}" is not among '
+            "the records in the folder, so whether it follows from this run is "
+            "not known.",
+            stdout,
+        )
+        # The file is back at its original name; with the chain broken, the
+        # report must not claim that no undo record says why.
+        self.assertIn("no known undo record says it was put back", stdout)
+        self.assertIn("back with no known undo record to say why", stdout)
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(applied), "--format", "json"
+        )
+        report = json.loads(stdout)
+        self.assertEqual(report["unreadable_records"], [])
+        self.assertFalse(report["summary"]["history_complete"])
+        self.assertEqual(len(report["unplaced_runs"]), 2)
+
+    def test_looping_undo_records_are_named_and_do_not_hang(self):
+        self.write("tidy-me.txt", b"pretend contents")
+        applied = Path(self.apply(self.save_plan())["record"]["path"])
+        folder = applied.parent
+        names = ("run-loop-a.jsonl", "run-loop-b.jsonl")
+        for name, undoing in zip(names, reversed(names)):
+            start = {"record": "start", "schema_version": 1, "root": str(self.root),
+                     "kind": "undo", "undoing": undoing, "time": "t",
+                     "planned": 0, "skipped": 0}
+            end = {"record": "end", "completed": True, "outcomes": {}}
+            (folder / name).write_text(
+                json.dumps(start) + "\n" + json.dumps(end) + "\n", encoding="utf-8"
+            )
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(applied))
+
+        self.assertEqual((code, stderr), (0, ""))
+        for name, undoing in zip(names, reversed(names)):
+            self.assertIn(
+                f'"{name}" undid "{undoing}", but its chain of undone records '
+                "loops, so whether it follows from this run is not known.",
+                stdout,
+            )
 
     def test_a_readable_history_is_not_warned_about(self):
         self.write("tidy-me.txt", b"pretend contents")
@@ -4035,7 +4133,7 @@ class RunInspectionTests(_ApplyFixture):
         self.assertEqual(code, 0)
         self.assertNotIn("could not be used", stdout)
         self.assertNotIn("may therefore be missing", stdout)
-        self.assertNotIn("readable undo record", stdout)
+        self.assertNotIn("known undo record", stdout)
 
     def test_a_folder_with_no_records_says_so(self):
         self.write("tidy-me.txt", b"pretend contents")

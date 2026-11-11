@@ -527,11 +527,15 @@ A file whose outcome was `unknown` stays unknown: the run could not tell
 whether it moved, so neither does this.
 
 A record in the folder that cannot be read is named in the report with the
-reason, rather than silently left out. One of the missing runs could be the
-undo that explains a file, so the report then stops short of claiming that no
-undo record exists: a file found back at its original name is said to have no
-*readable* undo record to say why, the JSON report lists each unreadable
-record under `unreadable_records`, and its summary says
+reason, rather than silently left out. So is a readable undo whose chain of
+undone records cannot be traced to a readable run, because a record above it
+cannot be read, is no longer in the folder, or loops: it may be an undo or
+redo of this run, so it is named with what broke the trace, but nothing is
+counted from it, since its place in the chain would be a guess. Either way
+the report stops short of claiming that no undo record exists: a file found
+back at its original name is said to have no *known* undo record to say why,
+the JSON report lists each unreadable record under `unreadable_records` and
+each untraceable run under `unplaced_runs`, and its summary says
 `"history_complete": false`. A record that is malformed in any way is refused
 with what is wrong with it; it never stops `--show`, `--undo`, or anything
 else with a crash.
@@ -621,9 +625,12 @@ latest later run that tried it, `undone_by` only when a reversing run
 confirmed moving it back and it is there now, and `redone_by` only when a
 repeating run confirmed moving it again and it is there now.
 `unreadable_records` lists every record in the folder that could not be read,
-each with the `problem`, and the summary's `history_complete` is false while
-that list is not empty, since one of those records could change what the
-chain and the counts above would say.
+each with the `problem`. `unplaced_runs` lists every readable undo that could
+not be traced to a readable run, each with the record it undid (`undoing`),
+its physical `direction`, whether it `completed`, the `broken_link` where the
+trace stopped (absent for a loop), and the `problem`. The summary's
+`history_complete` is false while either list is not empty, since any of
+those records could change what the chain and the counts above would say.
 
 Files are looked at with the same checks an undo would make, so the last line
 is also a forecast: how many `--undo` would move, and how many it would leave
