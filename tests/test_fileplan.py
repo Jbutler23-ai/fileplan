@@ -2162,6 +2162,21 @@ class UndoTests(_ApplyFixture):
                 good[:2]
                 + [json.dumps({"record": "done", "index": True, "outcome": "moved"})]
             ),
+            "a kind that is neither apply nor undo": "\n".join(
+                [json.dumps(dict(json.loads(good[0]), kind="tidy"))] + good[1:]
+            ),
+            "no kind at all": "\n".join(
+                [
+                    json.dumps(
+                        {k: v for k, v in json.loads(good[0]).items() if k != "kind"}
+                    )
+                ]
+                + good[1:]
+            ),
+            "an undo that does not say what it undid": "\n".join(
+                [json.dumps(dict(json.loads(good[0]), kind="undo", undoing=None))]
+                + good[1:]
+            ),
         }
         for label, payload in payloads.items():
             with self.subTest(payload=label):
@@ -3976,6 +3991,38 @@ class RunInspectionTests(_ApplyFixture):
         # The undone run cannot be counted, so nothing claims the file was put back.
         self.assertEqual(report["undo_runs"], [])
         self.assertEqual(report["summary"]["put_back"], 0)
+
+    def test_an_undo_with_a_damaged_kind_is_named_not_skipped(self):
+        """A wrong kind must not quietly drop an undo from the chain."""
+        self.write("tidy-me.txt", b"pretend contents")
+        record = Path(self.apply(self.save_plan())["record"]["path"])
+        code, _, _ = self.run_cli(str(self.root), "--undo", str(record))
+        self.assertEqual(code, 0)
+        undo = next(path for path in self.record_files() if path != record)
+        lines = undo.read_text().splitlines()
+        lines[0] = json.dumps(dict(json.loads(lines[0]), kind="restore"))
+        undo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(record))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            f'"{undo}" could not be used: the start record\'s kind must be '
+            "\"apply\" or \"undo\", found 'restore'.",
+            stdout,
+        )
+        self.assertIn("Later runs may therefore be missing", stdout)
+        self.assertIn("no readable undo record says it was put back", stdout)
+        self.assertNotIn("no undo record says", stdout)
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(record), "--format", "json"
+        )
+        report = json.loads(stdout)
+        self.assertEqual(
+            [item["record"] for item in report["unreadable_records"]], [str(undo)]
+        )
+        self.assertFalse(report["summary"]["history_complete"])
 
     def test_a_readable_history_is_not_warned_about(self):
         self.write("tidy-me.txt", b"pretend contents")

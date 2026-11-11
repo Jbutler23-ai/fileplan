@@ -2203,13 +2203,23 @@ def load_record(path: Path) -> dict:
         )
     if not isinstance(start.get("root"), str) or not start["root"]:
         reject("the start record has no root")
+    # The kind decides which way files are allowed to move and whether the
+    # record belongs in a chain of undos, so a record without a usable one
+    # cannot be read cautiously; it is refused, never guessed at or passed
+    # over in silence.
+    run_kind = start.get("kind")
+    if run_kind not in ("apply", "undo"):
+        reject(f'the start record\'s kind must be "apply" or "undo", found {run_kind!r}')
+    if run_kind == "undo" and (
+        not isinstance(start.get("undoing"), str) or not start["undoing"]
+    ):
+        reject("an undo record does not name the record it undid")
 
     # An apply always moves into the organised folder. An undo moves the other
     # way from the run it undoes: out of the folder for an apply, back into it
     # for an undo (a redo). Either way every file in one record moves the same
     # way, and the first entry says which.
-    # The comparison tolerates a kind of any type; only "apply" means anything.
-    kind_expected = "destination" if start.get("kind") == "apply" else None
+    kind_expected = "destination" if run_kind == "apply" else None
     entries: dict[int, dict] = {}
     order: list[int] = []
     for item in parsed[1:]:
@@ -2241,9 +2251,9 @@ def load_record(path: Path) -> dict:
                     f"neither {item['source']} nor {item['destination']} is a file "
                     f"inside {DESTINATION_NAME}"
                 )
-            if kind_expected is None and start.get("kind") == "undo":
+            if kind_expected is None and run_kind == "undo":
                 kind_expected = stored
-            if start.get("kind") == "undo" and stored != kind_expected:
+            if run_kind == "undo" and stored != kind_expected:
                 reject(
                     "every file in an undo record must move the same way, but "
                     f"{item['source']} does not"
@@ -2303,7 +2313,7 @@ def load_record(path: Path) -> dict:
         "path": str(path),
         "root": start["root"],
         "plan": typed(start.get("plan"), str),
-        "kind": typed(start.get("kind"), str),
+        "kind": run_kind,
         "started": typed(start.get("time"), str),
         "planned": planned,
         "passed_over": passed_over,
@@ -2760,7 +2770,9 @@ def _later_runs(record_name: str, root: Path) -> tuple[list[dict], list[dict]]:
                 {"record": str(folder / name), "problem": error.detail or str(error)}
             )
             continue
-        if other["kind"] != "undo" or not other["undoing"]:
+        # An undo record always names what it undid; load_record refuses one
+        # that does not, so no undo can be passed over here for a bad field.
+        if other["kind"] != "undo":
             continue
         # Records are named uniquely and live in the one folder, so the name
         # identifies the record even if the undo was given a relative path.
