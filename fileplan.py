@@ -2214,6 +2214,15 @@ def load_record(path: Path) -> dict:
         not isinstance(start.get("undoing"), str) or not start["undoing"]
     ):
         reject("an undo record does not name the record it undid")
+    # An apply never writes an undoing field, so one that has it contradicts
+    # itself: a redo whose kind was damaged to "apply" reads exactly like
+    # this, since a redo also moves files into the organised folder. Trusting
+    # the kind would drop that redo, and every run after it, from the chain.
+    if run_kind == "apply" and "undoing" in start:
+        reject(
+            "an apply record names a record it undid, so whether it applied "
+            "a plan or undid a run is not known"
+        )
 
     # An apply always moves into the organised folder. An undo moves the other
     # way from the run it undoes: out of the folder for an apply, back into it

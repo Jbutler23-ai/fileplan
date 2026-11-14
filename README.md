@@ -538,7 +538,11 @@ the JSON report lists each unreadable record under `unreadable_records` and
 each untraceable run under `unplaced_runs`, and its summary says
 `"history_complete": false`. A record that is malformed in any way is refused
 with what is wrong with it; it never stops `--show`, `--undo`, or anything
-else with a crash.
+else with a crash. That includes a record whose kind contradicts the rest of
+it, such as an apply that names a record it undid: a redo whose kind was
+damaged to `apply` looks just like that, so it is named as unreadable, along
+with the runs after it, rather than taken for an apply and dropped from the
+chain.
 
 ### Undo, redo, and undo again
 
@@ -783,7 +787,8 @@ python -m build
 The test workflow covers Windows, Linux, and macOS with Python 3.10, 3.12, and
 3.14, plus installation checks. Tests use temporary sample folders. The apply
 and undo tests run on Linux and Windows; on macOS they are skipped and the
-refusal is tested instead.
+refusal is tested instead. On Windows, the tests that create symlinks need
+administrator rights or Developer Mode, and are skipped without them.
 
 ## License
 

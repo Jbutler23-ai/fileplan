@@ -114,7 +114,144 @@ a readable run because a record above it is unreadable, gone, or loops. While
 either is true the report says its history may be incomplete rather than
 claiming no undo record exists, and credits nothing from a run it cannot
 place. A record malformed in any way is refused with a message saying what is
-wrong, never a crash.
+wrong, never a crash. That includes a record whose kind contradicts the rest of
+it: an apply that names a record it undid is what a redo with a damaged kind
+looks like, so it is refused and named rather than taken for an apply and
+dropped from the chain along with every run after it.
+
+## Testing status (as of 2026-11-13)
+
+What has been run against the current code, and where:
+
+- **Linux:** the full suite, 258 tests, passes. The 2 skips are the
+  Windows-only tests.
+- **Windows (real, not CI):** the full suite, 258 tests, passes with **no
+  skips** when run as administrator. That run included all 7 tests that need
+  to create symlinks, so the Windows link protections are now tested for real:
+  a source swapped for a link mid-move is refused and left alone, a link at
+  the destination is not read for comparison, a linked source is skipped, and
+  undo and verification refuse links. Without administrator rights or
+  Developer Mode those 7 skip, and everything else still passes.
+- **A damaged redo marked as an apply** is tested on both: it is named as
+  unreadable, the runs after it are named as unplaced, and the history is
+  reported as incomplete.
+
+Fixed along the way: the swapped-link test used to fail on Windows without
+link rights instead of skipping, because it asked to skip from inside the
+rename, and apply rightly reports anything raised there as a move whose
+outcome is unknown. It now checks for link rights before the move starts.
+
+How to run the tests on real Windows: the portable Python there has a `._pth`
+file that always imports the copy in `fileplan-win\repo`, so a plain
+`unittest discover` from any other folder silently tests old code. Put the
+folder being tested first on `sys.path`; `run_elevated.cmd` in the latest
+`%TEMP%\fileplan-applyundoing-*` copy does this, runs as administrator, and
+writes `elevated.log`, whose first two lines say whether it was elevated and
+whether a link could be made.
+
+### Damaged-record fuzzer rerun (2026-11-13, done)
+
+The fuzzer is `driver-fuzz\fuzz.py` in
+`%TEMP%\fileplan-records-20261109-224507` (`fuzz2.py` beside it is
+identical). It writes a record, puts each of 14 odd JSON values into every
+field of every line in turn, and feeds the result through reading, `--show`,
+and undo, counting any crash other than a clean refusal. That folder's own
+`repo` copy is old code, so reruns use a fresh copy in
+`%TEMP%\fileplan-fuzz-20261113-161814`, with the current `fileplan.py` in
+`repo` and the original fuzzer copied unchanged.
+
+1. **Original fuzzer, current code, Linux:** 392 cases, 0 crashes, but only
+   2 of 393 record reads got past `load_record`. Against HEAD (before the
+   redo fix) the same run had 379. The cause is the fuzzer, not the code: its
+   template apply record carries `"undoing": null`, which fileplan never
+   writes, and an apply that has that field is now refused as a possible
+   damaged redo. So nearly every case is refused at the first step and never
+   reaches `--show` or undo. **A clean result from the original fuzzer no
+   longer means much;** the template needs fixing.
+2. **Corrected fuzzer, `driver-fuzz\fuzz3.py`** in the new folder (the
+   original is left as it was). Same mutations, but the apply template has
+   no `undoing` field, each case is classed as refused at reading or run all
+   the way through `--show` and undo, and 15 new cases give an apply an
+   `undoing` field (each odd value plus a real-looking record name) and fail
+   unless every one is refused.
+3. **Corrected fuzzer, current code, Linux:** 394 cases, 0 crashes, all 15
+   damaged-redo cases refused; 176 cases run all the way through, 217 are
+   refused at reading, 1 later.
+4. **Control, corrected fuzzer against HEAD, Linux:** 0 crashes, but all 15
+   damaged-redo cases get through, so the new cases do catch the bug. 191
+   run through, which is the 176 above plus exactly those 15: the fix
+   refuses nothing it was not meant to.
+5. **Real Windows, same code:** the original fuzzer gives the same 392
+   cases, 0 crashes, 2 records read; the corrected one gives 394 cases, 0
+   crashes, all 15 damaged-redo cases refused, and the same 176 / 217 / 1
+   split as Linux.
+
+Result: no crash on either system, and a redo marked as an apply is refused
+whatever its link holds. The fuzzer lived outside the repo, which is how its
+template drifted from real records without anyone noticing, so it is now part
+of the test suite (below). The copies under `%TEMP%` are no longer needed.
+
+### Damaged-record checks in the test suite (2026-11-13, done)
+
+The corrected fuzzer is now `DamagedRecordFuzzTests` in
+`tests/test_fileplan.py`, so CI runs it on every platform and Python version
+in the matrix. It uses the same 394 cases as `fuzz3.py`, with made-up names.
+Four tests:
+
+- **The template is a usable record** (every platform): the untouched record
+  reads back as a complete apply.
+- **Every damaged record is read or refused cleanly** (every platform): no
+  case may raise anything but a clean refusal, and all 15 applies that name
+  a record they undid must be refused.
+- **The template runs through `--show` and undo** (where moves work).
+- **Every readable damaged record shows and undoes cleanly** (where moves
+  work): every case that reads must get through the report, its JSON and
+  plain output, and undo without a crash, and more than 100 cases must get
+  all the way through, so a drifted template fails instead of passing
+  quietly.
+
+Checked by breaking the code on purpose, in a scratch copy, three ways; each
+was caught and the failure named the case:
+
+1. **Without the redo fix:** the 15 damaged-redo cases fail.
+2. **With `"undoing": null` back in the template** (today's drift): both
+   template tests fail, and the coverage floor fails with only 2 cases
+   getting through.
+3. **Without the check that an outcome is text** (fixed in `0fd52d8`): a
+   list or dict outcome crashes `--show` with a `TypeError`, and the test
+   fails naming those cases.
+
+Results on the current code:
+
+- **Linux, Python 3.14:** 262 tests pass (258 before plus these 4), 2
+  Windows-only skips. The 4 run in about a tenth of a second.
+- **Real Windows, Python 3.12:** 262 tests pass; the 7 skips are the link
+  tests, run without administrator rights this time.
+- **Simulated macOS** (safe moves switched off before the tests load): the
+  2 reading tests run and pass, the 2 `--show` and undo tests skip.
+
+Not yet checked:
+
+- **CI** has not run on these changes. GitHub's Windows runners should be
+  able to make links, but whether the 7 link tests actually run there rather
+  than skip has not been confirmed from a CI log.
+- **Python 3.10**, the oldest in the CI matrix, is not installed on either
+  machine here, so CI will be the first to run the suite on it.
+- **macOS** has only been covered by CI, where applying is refused (see
+  above).
+
+Next, in order:
+
+1. Commit the redo fix, the link-test fix, and the damaged-record tests,
+   which are all still uncommitted, and push so CI runs them.
+2. Check that CI run: every job green, including Python 3.10 and macOS, and
+   in the Windows logs, whether the 7 link tests run or skip.
+3. The macOS decision above.
+
+One gap is known and cannot be closed from the record alone: an undo whose
+kind is changed to "apply" and whose link to the record it undid is removed
+reads exactly like a real apply. It would also have to move files into the
+organised folder, so only a redo that lost both fields gets through.
 
 The remaining estimate is **2-3 hours**. These are proposed next steps, not
 claims about past development time or a release schedule.

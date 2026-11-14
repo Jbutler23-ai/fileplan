@@ -1143,16 +1143,23 @@ class ApplyTests(_ApplyFixture):
     def test_apply_reports_a_source_swapped_for_a_link_as_it_moves(self):
         self.write("tidy-me.txt", b"pretend contents")
         decoy = self.write("elsewhere/decoy.txt", b"pretend decoy")
+        # Find out up front whether links can be made. Skipping from inside the
+        # rename would not work: apply reports any exception the rename raises
+        # as a move whose outcome is unknown, SkipTest included, so the test
+        # would fail on a machine without link rights instead of skipping.
+        probe = self.root / "elsewhere/link-probe"
+        try:
+            probe.symlink_to(decoy)
+        except OSError as error:
+            self.skipTest(f"symlink creation unavailable: {error}")
+        probe.unlink()
         plan_path = self.save_plan()
         source = self.root / "tidy-me.txt"
         real_rename = fileplan._rename_noreplace
 
         def rename(*args):
             source.unlink()
-            try:
-                source.symlink_to(decoy)
-            except OSError as error:
-                self.skipTest(f"symlink creation unavailable: {error}")
+            source.symlink_to(decoy)
             real_rename(*args)
 
         with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename):
@@ -2176,6 +2183,17 @@ class UndoTests(_ApplyFixture):
             "an undo that does not say what it undid": "\n".join(
                 [json.dumps(dict(json.loads(good[0]), kind="undo", undoing=None))]
                 + good[1:]
+            ),
+            "an apply that names a record it undid": "\n".join(
+                [
+                    json.dumps(
+                        dict(json.loads(good[0]), undoing="run-pretend.jsonl")
+                    )
+                ]
+                + good[1:]
+            ),
+            "an apply with an empty link to a record it undid": "\n".join(
+                [json.dumps(dict(json.loads(good[0]), undoing=None))] + good[1:]
             ),
         }
         for label, payload in payloads.items():
@@ -4122,6 +4140,50 @@ class RunInspectionTests(_ApplyFixture):
                 stdout,
             )
 
+    def test_a_redo_marked_apply_is_named_not_skipped(self):
+        """A redo whose kind became "apply" must not drop out of the chain."""
+        applied, undo, redo, again = self.undo_chain(3)
+        # A redo moves files into the organised folder just as an apply does,
+        # so only its link to the undo it undid gives the damage away.
+        lines = redo.read_text().splitlines()
+        lines[0] = json.dumps(dict(json.loads(lines[0]), kind="apply"))
+        redo.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--show", str(applied))
+
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn(
+            f'"{redo}" could not be used: an apply record names a record it '
+            "undid, so whether it applied a plan or undid a run is not known.",
+            stdout,
+        )
+        # The undo of the damaged redo is readable but can no longer be placed.
+        self.assertIn(
+            f'"{again.name}" undid "{redo.name}", but "{redo.name}" cannot be '
+            "read, so whether it follows from this run is not known.",
+            stdout,
+        )
+        self.assertIn("Later runs may therefore be missing", stdout)
+
+        code, stdout, _ = self.run_cli(
+            str(self.root), "--show", str(applied), "--format", "json"
+        )
+        report = json.loads(stdout)
+        self.assertFalse(report["summary"]["history_complete"])
+        self.assertEqual(
+            [Path(run["record"]).name for run in report["undo_runs"]], [undo.name]
+        )
+        self.assertEqual(
+            [Path(item["record"]).name for item in report["unreadable_records"]],
+            [redo.name],
+        )
+        self.assertEqual(
+            [(Path(run["record"]).name, Path(run["broken_link"]).name,
+              run["problem"])
+             for run in report["unplaced_runs"]],
+            [(again.name, redo.name, "cannot be read")],
+        )
+
     def test_a_readable_history_is_not_warned_about(self):
         self.write("tidy-me.txt", b"pretend contents")
         record = Path(self.apply(self.save_plan())["record"]["path"])
@@ -4986,6 +5048,129 @@ class RunInspectionTests(_ApplyFixture):
 
                 self.assertEqual((code, stdout), (2, ""))
                 self.assertIn(f"remove {extra[0]}", stderr)
+
+
+class DamagedRecordFuzzTests(unittest.TestCase):
+    """Odd values in every field of a record are refused or handled, never a crash.
+
+    Each case starts from a record shaped exactly like one fileplan writes,
+    then puts one odd JSON value into one field. The template itself is
+    checked first: if it stopped being a usable record, nearly every case
+    would be refused on reading and the rest of these checks would pass
+    without testing anything.
+    """
+
+    ODD = [None, True, False, 0, -1, 7, 1.5, "", "x", [], [0], {}, {"a": 1}, [["x"]]]
+    # Shaped like the records fileplan writes. An apply never has "undoing".
+    START = {"record": "start", "schema_version": 1, "root": None, "kind": "apply",
+             "time": "t", "planned": 1, "skipped": 0, "plan": None}
+    INTENT = {"record": "intent", "index": 0, "source": "pretend-note.txt",
+              "destination": "_organized/txt/pretend-note.txt", "size_bytes": 1,
+              "modified_ns": 1, "sha256": None}
+    DONE = {"record": "done", "index": 0, "outcome": "moved"}
+    END = {"record": "end", "completed": True, "outcomes": {}, "stopped_at": None}
+
+    def cases(self):
+        """Yield (label, lines without a root, must be refused) for every case."""
+        template = [self.START, self.INTENT, self.DONE, self.END]
+        for position, line in enumerate(template):
+            for field in list(line) + ["extra"]:
+                for odd in self.ODD:
+                    lines = [dict(item) for item in template]
+                    lines[position][field] = odd
+                    yield f"line {position} {field}={odd!r}", lines, False
+        # An undo, with every odd value as the record it undid.
+        undo = [
+            dict(self.START, kind="undo"),
+            dict(self.INTENT, source="_organized/txt/pretend-note.txt",
+                 destination="pretend-note.txt"),
+            dict(self.DONE, outcome="restored"),
+            dict(self.END),
+        ]
+        for odd in self.ODD + ["run-pretend.jsonl"]:
+            lines = [dict(item) for item in undo]
+            lines[0]["undoing"] = odd
+            yield f"undo undoing={odd!r}", lines, False
+        # An apply that names a record it undid is what a redo whose kind was
+        # damaged looks like, so it must be refused whatever the link holds.
+        for odd in self.ODD + ["run-pretend.jsonl"]:
+            lines = [dict(item) for item in template]
+            lines[0]["undoing"] = odd
+            yield f"apply undoing={odd!r}", lines, True
+
+    def write_record(self, lines):
+        """Write the record into a fresh folder; return (root, record path)."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        root = Path(holder.name).resolve()
+        folder = root / fileplan.DESTINATION_NAME / fileplan.JOURNAL_DIRECTORY
+        folder.mkdir(parents=True)
+        path = folder / "run-20260101T000000000000Z-1.jsonl"
+        lines = [dict(lines[0], root=str(root))] + lines[1:]
+        path.write_text(
+            "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+        )
+        return root, path
+
+    def show_and_undo(self, record, root, path):
+        """Run a record through --show and undo the way the commands do."""
+        report = fileplan.inspect_run(record, root, path)
+        fileplan._plain_run_output(report)
+        json.dumps(report)
+        # The file the record names is absent, so undo is blocked and moves nothing.
+        fileplan._plain_undo_output(fileplan.undo_record(record, root, path))
+
+    def test_the_template_is_a_usable_record(self):
+        _, path = self.write_record(
+            [dict(self.START), dict(self.INTENT), dict(self.DONE), dict(self.END)]
+        )
+        record = fileplan.load_record(path)
+        self.assertEqual(record["kind"], "apply")
+        self.assertTrue(record["complete"])
+
+    def test_every_damaged_record_is_read_or_refused_cleanly(self):
+        for label, lines, must_refuse in self.cases():
+            with self.subTest(case=label):
+                _, path = self.write_record(lines)
+                if must_refuse:
+                    with self.assertRaises(fileplan.FilePlanError):
+                        fileplan.load_record(path)
+                else:
+                    try:
+                        fileplan.load_record(path)
+                    except fileplan.FilePlanError:
+                        pass
+
+    @unittest.skipUnless(
+        fileplan._SAFE_MOVE_SUPPORTED, "needs directory handles and the no-replace rename"
+    )
+    def test_the_template_runs_through_show_and_undo(self):
+        root, path = self.write_record(
+            [dict(self.START), dict(self.INTENT), dict(self.DONE), dict(self.END)]
+        )
+        self.show_and_undo(fileplan.load_record(path), root, path)
+
+    @unittest.skipUnless(
+        fileplan._SAFE_MOVE_SUPPORTED, "needs directory handles and the no-replace rename"
+    )
+    def test_every_readable_damaged_record_shows_and_undoes_cleanly(self):
+        ran = 0
+        for label, lines, _ in self.cases():
+            with self.subTest(case=label):
+                root, path = self.write_record(lines)
+                try:
+                    record = fileplan.load_record(path)
+                except fileplan.FilePlanError:
+                    continue
+                try:
+                    self.show_and_undo(record, root, path)
+                except fileplan.FilePlanError:
+                    continue
+                ran += 1
+        # Most odd values sit in fields that are only reported, so most cases
+        # must get all the way through; a handful would mean the template had
+        # drifted and the cases were being refused before testing anything.
+        self.assertGreater(ran, 100)
 
 
 class TerminalTextTests(unittest.TestCase):
