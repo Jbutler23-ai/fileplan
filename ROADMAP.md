@@ -230,22 +230,44 @@ Results on the current code:
 - **Simulated macOS** (safe moves switched off before the tests load): the
   2 reading tests run and pass, the 2 `--show` and undo tests skip.
 
+### CI (2026-11-14, failing, cause not yet known)
+
+Commit `6f5c6a2` was pushed to branch
+`hfi/f1a6cffa-25a3-4b2c-b929-79bbc1c0f39a/oak`; run 43654833634. All three
+macOS jobs pass. All three Ubuntu jobs and all three Windows jobs fail in
+the "Run tests" step, on every Python version.
+
+- **Ubuntu was already failing on `main`:** on `1fc81ff` (1 Nov) the 3.10
+  and 3.12 jobs failed and 3.14 passed; on `0cd3de6` (8 Nov) all three
+  failed. So at least part of the Ubuntu failure predates this work. The
+  suite from `0cd3de6` passes here on Linux (WSL, Python 3.14), and the
+  current suite passes here under the C.UTF-8, C and POSIX locales, so the
+  cause is something about the GitHub Ubuntu machines that the job logs
+  would show.
+- **Windows is new:** both earlier `main` runs were green on Windows. The
+  GitHub runner is an administrator, so it runs the 7 link tests; the last
+  elevated run here was before the damaged-record tests were added, so that
+  is the first thing to rerun locally.
+- **The job logs could not be read from here:** the public API gives job
+  results but logs need a login, and the only public annotation is
+  "Process completed with exit code 1". Whether the link tests run or skip
+  on GitHub's Windows machines is in those logs too.
+
 Not yet checked:
 
-- **CI** has not run on these changes. GitHub's Windows runners should be
-  able to make links, but whether the 7 link tests actually run there rather
-  than skip has not been confirmed from a CI log.
-- **Python 3.10**, the oldest in the CI matrix, is not installed on either
-  machine here, so CI will be the first to run the suite on it.
+- **Python 3.10** has now run the suite in CI but, with every Ubuntu and
+  Windows job failing, nothing can be said about it yet.
 - **macOS** has only been covered by CI, where applying is refused (see
   above).
 
 Next, in order:
 
-1. Commit the redo fix, the link-test fix, and the damaged-record tests,
-   which are all still uncommitted, and push so CI runs them.
-2. Check that CI run: every job green, including Python 3.10 and macOS, and
-   in the Windows logs, whether the 7 link tests run or skip.
+1. Read the Ubuntu and Windows "Run tests" logs from run 43654833634 and
+   find what fails there; rerun the suite as administrator on real Windows
+   with the current code.
+2. Fix what the logs show, or the tests' assumptions about the runners,
+   until every job is green, then confirm from the Windows logs whether the
+   7 link tests run or skip.
 3. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
