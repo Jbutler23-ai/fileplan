@@ -325,7 +325,14 @@ on all nine jobs, every step included. `main` had been red since
 
 Next:
 
-1. The macOS decision above.
+See [HANDOFF.md](HANDOFF.md) for where work stopped on 2026-11-15 and how to
+pick it up.
+
+1. Review the test in `a6a5038`, available through the remote-tracking
+   `origin/hfi/f1a6cffa-25a3-4b2c-b929-79bbc1c0f39a/oak` branch, that an
+   unreadable file still moves. Bring the test change onto `main` if it holds.
+2. Ignore rules, planned in [PLAN-ignore-rules.md](PLAN-ignore-rules.md).
+3. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
 kind is changed to "apply" and whose link to the record it undid is removed
