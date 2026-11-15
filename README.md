@@ -720,8 +720,15 @@ source is looked at once more and the destination folder's position under the
 scanned folder is confirmed once more. Immediately after it, the folder's
 position is confirmed again, the old name must be gone, and the new name must
 refer to the checked file with the size and modification time the plan
-recorded. Anything unexpected stops the run with a report; none of these looks
-changes anything on disk, and fileplan never deletes.
+recorded. Whether it is the checked file is decided by the file's identity on
+disk, its device and inode number or the Windows equivalent. On Linux a
+filesystem may hand a deleted file's number straight to the next file
+created, so fileplan holds the checked file open from the look before the
+move to the look after it; while it is held, its number cannot be reused. The
+hold grants nothing but a look at the file's metadata, so it needs no right to
+read the file and stops no other program from renaming or deleting it.
+Anything unexpected stops the run with a report; none of these looks changes
+anything on disk, and fileplan never deletes.
 
 When that call is unavailable, the run stops; no other method is tried. Only
 Linux and Windows offer it, so applying is refused up front on other systems,

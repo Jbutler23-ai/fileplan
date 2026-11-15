@@ -1261,6 +1261,23 @@ class ApplyTests(_ApplyFixture):
         self.assertFalse((self.root / "_organized/txt/tidy-me.txt").exists())
         self.assertEqual(source.read_bytes(), b"pretend contents")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the hold is Linux-only")
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads anything")
+    def test_a_file_that_cannot_be_read_still_moves(self):
+        # Holding the file across the move must not require reading it, which
+        # is what O_PATH is for; a plain read-only open would refuse this file.
+        source = self.write("tidy-me.txt", b"pretend contents")
+        plan_path = self.save_plan()
+        source.chmod(0)
+        landed = self.root / "_organized/txt/tidy-me.txt"
+        self.addCleanup(lambda: landed.exists() and landed.chmod(0o600))
+
+        report = self.apply(plan_path)
+
+        self.assertEqual(report["results"][0]["outcome"], "moved")
+        self.assertEqual(report["summary"]["moved_confirmed"], 1)
+        self.assertTrue(landed.exists())
+
     def test_apply_stops_before_moving_when_the_folder_is_moved_outside(self):
         self.write("tidy-me.txt", b"pretend contents")
         plan_path = self.save_plan()

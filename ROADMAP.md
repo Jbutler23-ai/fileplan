@@ -261,7 +261,7 @@ https://github.com/Jbutler23-ai/fileplan/actions/runs/43654829329.
   that quickly; the cause follows from the order of the checks in
   `_confirm_move`.
 
-### Fixing what CI found (2026-11-14, pushed, awaiting CI)
+### Fixing what CI found (2026-11-14, commit 861d516, CI green)
 
 - **Windows:** `_ApplyFixture` now resolves its temp folders, so tests and
   fileplan spell paths the same way. A test-only fix.
@@ -295,9 +295,31 @@ Checked locally before pushing:
 - **Not reproducible locally:** Ubuntu's inode reuse itself. The Ubuntu CI
   jobs are the real check that the two long-failing tests now pass.
 
+### Second CI run (2026-11-15, commit 861d516)
+
+https://github.com/Jbutler23-ai/fileplan/actions/runs/43669581945. **All 9
+jobs pass**, 264 tests each, on Python 3.10, 3.12, and 3.14. The Ubuntu
+jobs are the first green Ubuntu jobs since the project's first CI run: the
+two swap tests that had failed there since 2026-11-01 now pass, which
+confirms the inode-reuse diagnosis and the fix. Skips, all expected:
+
+- **Ubuntu:** 2, the Windows reserved-name tests.
+- **Windows:** 2, the Linux-only hold tests. The 7 link tests ran and
+  passed again, and the 6 `--show` tests that failed last time pass.
+- **macOS:** 154, every test that moves files plus the 2 Windows-only
+  tests. The damaged-record reading tests ran and passed.
+
+The same two fixes were written twice, in two sessions working on this
+branch at once; the second copy was set aside on the local branch
+`backup/hold-fix-duplicate` rather than pushed over the first. Two things
+from it were worth keeping and were added afterwards: a README passage on
+the hold, and a Linux test that a file with no read permission still moves,
+which is the reason the hold uses `O_PATH` rather than a read-only open.
+
 Next, in order:
 
-1. Push the fixes and check that CI is green on every job.
+1. Check the CI run for the follow-up commit (README passage and the
+   no-read-permission test).
 2. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
