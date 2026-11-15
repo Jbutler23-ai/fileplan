@@ -230,23 +230,75 @@ Results on the current code:
 - **Simulated macOS** (safe moves switched off before the tests load): the
   2 reading tests run and pass, the 2 `--show` and undo tests skip.
 
-Not yet checked:
+### First CI run of these changes (2026-11-14)
 
-- **CI** has not run on these changes. GitHub's Windows runners should be
-  able to make links, but whether the 7 link tests actually run there rather
-  than skip has not been confirmed from a CI log.
-- **Python 3.10**, the oldest in the CI matrix, is not installed on either
-  machine here, so CI will be the first to run the suite on it.
-- **macOS** has only been covered by CI, where applying is refused (see
-  above).
+Commit `6f5c6a2`, run
+https://github.com/Jbutler23-ai/fileplan/actions/runs/43654829329.
+
+- **macOS, all three Pythons:** pass. 152 skips, all expected: the 150
+  tests that move files (applying is refused there) and the 2 Windows
+  reserved-name tests. The new damaged-record reading tests ran and passed.
+- **Windows, all three Pythons:** 6 failures, **0 skips**. GitHub's Windows
+  runners can make links, so all 7 link tests ran and passed there. The 6
+  failures are `--show` tests about unreadable records, which had never been
+  through CI. The runner's account is `runneradmin`, so its temp folder is
+  given in the 8.3 short form `C:\Users\RUNNER~1\...`, while fileplan
+  reports record paths in the long form. The tests compared the two
+  spellings, took them for different files, and damaged or deleted the
+  wrong record. Reproduced locally by pointing the temp folder at an 8.3
+  short name: the same 6 fail.
+- **Ubuntu, all three Pythons:** 2 failures, 2 skips (the Windows-only
+  tests). The failures are `test_apply_reports_a_file_replaced_right_after_the_move`
+  and `test_apply_reports_a_source_swapped_for_a_link_as_it_moves`, and
+  they have failed on Ubuntu since the first commit on 2026-11-01; every
+  `main` run since then shows the same two. Both delete a file and
+  immediately create another. Ubuntu's filesystem hands the freed inode
+  number straight to the new file, so the identity check after the move
+  sees the same file, and the swap is only caught one check later as a size
+  change or a link. The run still stops and the move is still reported
+  unconfirmed, but the reason says the file "is at" its destination when it
+  was replaced. Not reproduced locally, where inode numbers are not reused
+  that quickly; the cause follows from the order of the checks in
+  `_confirm_move`.
+
+### Fixing what CI found (2026-11-14, pushed, awaiting CI)
+
+- **Windows:** `_ApplyFixture` now resolves its temp folders, so tests and
+  fileplan spell paths the same way. A test-only fix.
+- **Ubuntu:** fixed in the code, not by loosening the tests. Comparing inode
+  numbers only proves identity while the file is held open, since a freed
+  number can be reused. Apply and undo (both go through
+  `_move_with_handles`) now hold the source open, through `_pin_source`,
+  from the last check before the move until the check after it, so its
+  number cannot be handed to a replacement and "refers to a different
+  file" is reliable on any filesystem. On Linux the handle is `O_PATH |
+  O_NOFOLLOW`, so it needs no read permission and never follows a link.
+  Windows is left as it was: its file IDs carry a sequence number that
+  changes when a slot is reused, and an extra handle could get in the way of
+  the rename's delete access.
+- **A gap this also closes:** a source swapped between the last check and
+  the move used to be moved and reported unconfirmed. Holding it open shows
+  the swap first, so it is now refused and nothing moves ("Source was
+  replaced as it was about to be moved").
+- **New tests**, Linux only: the source is held open during the move and
+  during the check after it, and let go afterwards; and a source replaced
+  just before it is held is refused. With the pin disabled in a scratch
+  copy, both fail; the second shows the swapped file being moved.
+
+Checked locally before pushing:
+
+- **Linux, Python 3.14:** 264 tests pass (262 plus the 2 new), 2 skips.
+- **Real Windows, Python 3.12, normal and 8.3 short-name temp folders:**
+  264 pass both ways. 9 skips: the 7 link tests (no administrator rights
+  this time; they ran on GitHub's Windows runners) and the 2 Linux-only
+  pin tests.
+- **Not reproducible locally:** Ubuntu's inode reuse itself. The Ubuntu CI
+  jobs are the real check that the two long-failing tests now pass.
 
 Next, in order:
 
-1. Commit the redo fix, the link-test fix, and the damaged-record tests,
-   which are all still uncommitted, and push so CI runs them.
-2. Check that CI run: every job green, including Python 3.10 and macOS, and
-   in the Windows logs, whether the 7 link tests run or skip.
-3. The macOS decision above.
+1. Push the fixes and check that CI is green on every job.
+2. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
 kind is changed to "apply" and whose link to the record it undid is removed

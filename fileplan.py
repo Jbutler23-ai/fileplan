@@ -1562,6 +1562,43 @@ def _stat_source(
     return metadata, _source_mismatch(metadata, saved)
 
 
+def _pin_source(
+    dir_fd: int, name: str, checked: os.stat_result
+) -> tuple[int | None, str | None]:
+    """Hold the checked source open until the move has been confirmed.
+
+    The check after a move compares device and inode numbers, which only
+    proves it is the same file while that file is held open: a file that is
+    deleted gives up its inode number, and Linux can hand it straight to the
+    next file created, so a replacement could pass for the moved file. An
+    open handle keeps the number taken. Windows needs no pin, because its
+    file IDs carry a sequence number that changes when a slot is reused.
+
+    Returns (handle, None), (None, None) where no pin is needed or possible,
+    or (None, reason) if the source can no longer be shown to be the file
+    just checked, in which case it must not be moved.
+    """
+    if _WINDOWS is not None or not hasattr(os, "O_PATH"):
+        return None, None
+    try:
+        fd = os.open(
+            name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+        )
+    except FileNotFoundError:
+        return None, "Source file is missing"
+    except OSError as error:
+        return None, f"Cannot hold the source open: {error.strerror or error}"
+    try:
+        held = os.fstat(fd)
+    except OSError as error:
+        os.close(fd)
+        return None, f"Cannot hold the source open: {error.strerror or error}"
+    if (held.st_dev, held.st_ino) != (checked.st_dev, checked.st_ino):
+        os.close(fd)
+        return None, "Source was replaced as it was about to be moved"
+    return fd, None
+
+
 def _handle_path(fd: int) -> str | None:
     """Best effort: where does this open folder live now? None if unknown."""
     if _WINDOWS is not None:
@@ -1670,7 +1707,7 @@ def _move_with_handles(
         root_fd = _open_root(root)
     except OSError as error:
         return f"Cannot open the selected folder: {error.strerror or error}"
-    source_fd = destination_fd = None
+    source_fd = destination_fd = pin_fd = None
     try:
         source_fd, reason = _open_chain(root_fd, source_parts[:-1], False, "Source")
         if reason:
@@ -1691,6 +1728,9 @@ def _move_with_handles(
         # Look at the source and the folder's position one last time, right
         # before the move, so the gap is as small as it can be.
         checked, reason = _stat_source(source_fd, source_name, saved)
+        if reason:
+            return reason
+        pin_fd, reason = _pin_source(source_fd, source_name, checked)
         if reason:
             return reason
         # A file whose contents were compared is compared again here. Size and
@@ -1753,7 +1793,7 @@ def _move_with_handles(
                 f"{error!r}"
             )
     finally:
-        for handle in (source_fd, destination_fd, root_fd):
+        for handle in (pin_fd, source_fd, destination_fd, root_fd):
             if handle is not None:
                 os.close(handle)
 

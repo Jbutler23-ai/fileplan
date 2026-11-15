@@ -733,11 +733,15 @@ class _ApplyFixture(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        # Resolved, because fileplan resolves the folder it works in and names
+        # records by that path. A temp folder can be given in another spelling,
+        # such as a Windows 8.3 short name like RUNNER~1, and two spellings of
+        # one path compare unequal even though they name the same file.
+        self.root = Path(directory.name).resolve()
         plans = tempfile.TemporaryDirectory()
         self.addCleanup(plans.cleanup)
         # Saved plans live outside the scanned folder so they are not planned.
-        self.plans = Path(plans.name)
+        self.plans = Path(plans.name).resolve()
 
     def write(self, name, content=b"pretend contents\n"):
         path = self.root / name
@@ -1182,6 +1186,80 @@ class ApplyTests(_ApplyFixture):
         moved_link = self.root / "_organized/txt/tidy-me.txt"
         self.assertTrue(moved_link.is_symlink())
         self.assertEqual(decoy.read_bytes(), b"pretend decoy")
+
+    @staticmethod
+    def open_handles_on(identity):
+        """How many of this process's open handles refer to the given file."""
+        count = 0
+        for name in os.listdir("/proc/self/fd"):
+            try:
+                held = os.fstat(int(name))
+            except OSError:
+                continue  # The handle os.listdir itself used, now closed.
+            if (held.st_dev, held.st_ino) == identity:
+                count += 1
+        return count
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "Linux can reuse a freed inode number at once"
+    )
+    def test_apply_holds_the_source_open_from_its_last_check_to_the_confirmation(self):
+        # The check after the move compares inode numbers, which only proves
+        # identity while the file is held open; otherwise a replacement can
+        # be given the moved file's freed number.
+        source = self.write("tidy-me.txt", b"pretend contents")
+        plan_path = self.save_plan()
+        before = source.stat()
+        identity = (before.st_dev, before.st_ino)
+        held = {}
+        real_rename = fileplan._rename_noreplace
+        real_confirm = fileplan._confirm_move
+
+        def rename(*args):
+            held["during the move"] = self.open_handles_on(identity)
+            real_rename(*args)
+
+        def confirm(*args):
+            held["during the confirmation"] = self.open_handles_on(identity)
+            return real_confirm(*args)
+
+        with mock.patch.object(fileplan, "_rename_noreplace", side_effect=rename), \
+                mock.patch.object(fileplan, "_confirm_move", side_effect=confirm):
+            report = self.apply(plan_path)
+
+        self.assertEqual(report["results"][0]["outcome"], "moved")
+        self.assertEqual(held, {"during the move": 1, "during the confirmation": 1})
+        # And it is let go once the move is confirmed.
+        self.assertEqual(self.open_handles_on(identity), 0)
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"), "Linux can reuse a freed inode number at once"
+    )
+    def test_apply_refuses_a_source_replaced_just_before_it_is_held(self):
+        source = self.write("tidy-me.txt", b"pretend contents")
+        plan_path = self.save_plan()
+        real_stat_source = fileplan._stat_source
+        calls = []
+        # Holding the original open keeps its inode number from going to the
+        # replacement, so the swap is visible the same way on any filesystem.
+        original = os.open(source, os.O_RDONLY)
+        self.addCleanup(os.close, original)
+
+        def stat_source(*args):
+            result = real_stat_source(*args)
+            calls.append(None)
+            if len(calls) == 2:  # The last look before the move.
+                source.unlink()
+                source.write_bytes(b"pretend contents")
+            return result
+
+        with mock.patch.object(fileplan, "_stat_source", side_effect=stat_source):
+            report = self.apply(plan_path)
+
+        self.assertEqual(report["results"][0]["outcome"], "not-moved")
+        self.assertIn("replaced as it was about to be moved", report["stopped"]["reason"])
+        self.assertFalse((self.root / "_organized/txt/tidy-me.txt").exists())
+        self.assertEqual(source.read_bytes(), b"pretend contents")
 
     def test_apply_stops_before_moving_when_the_folder_is_moved_outside(self):
         self.write("tidy-me.txt", b"pretend contents")
