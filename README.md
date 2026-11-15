@@ -723,6 +723,15 @@ refer to the checked file with the size and modification time the plan
 recorded. Anything unexpected stops the run with a report; none of these looks
 changes anything on disk, and fileplan never deletes.
 
+"The checked file" is decided by device and inode number, which only
+identifies a file for as long as it is held open: a deleted file gives up its
+number, and Linux can hand it straight to the next file created. So on Linux
+the source is held open, without following links and without needing read
+permission, from the look just before the move until the look just after, and
+a replacement can never share its number. A source swapped in the instant
+before the move is seen at that point and refused, so it is not moved at all.
+Windows needs no such hold: its file IDs change when a slot is reused.
+
 When that call is unavailable, the run stops; no other method is tried. Only
 Linux and Windows offer it, so applying is refused up front on other systems,
 including macOS. A filesystem that does not support the no-replace rename,

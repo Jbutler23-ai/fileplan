@@ -261,7 +261,7 @@ https://github.com/Jbutler23-ai/fileplan/actions/runs/43654829329.
   that quickly; the cause follows from the order of the checks in
   `_confirm_move`.
 
-### Fixing what CI found (2026-11-14, pushed, awaiting CI)
+### Fixing what CI found (2026-11-14, done, CI green)
 
 - **Windows:** `_ApplyFixture` now resolves its temp folders, so tests and
   fileplan spell paths the same way. A test-only fix.
@@ -295,9 +295,29 @@ Checked locally before pushing:
 - **Not reproducible locally:** Ubuntu's inode reuse itself. The Ubuntu CI
   jobs are the real check that the two long-failing tests now pass.
 
+### Second CI run, commit `861d516` (2026-11-14)
+
+https://github.com/Jbutler23-ai/fileplan/actions/runs/43669581945. **Every
+job green**, including the build and install steps: Ubuntu, Windows, and
+macOS on Python 3.10, 3.12, and 3.14, 264 tests each. This is the first
+green run since 2026-10-19; every run since the first commit had failed on
+Ubuntu.
+
+- **Ubuntu:** the two tests that had failed since 2026-11-01 pass on all
+  three Pythons, which confirms the inode-reuse diagnosis and the fix. The
+  two new pin tests pass. 2 skips, the Windows reserved-name tests.
+- **Windows:** the 6 short-name failures are gone. The 7 link tests ran and
+  passed again. 2 skips, the two Linux-only pin tests.
+- **macOS:** 154 skips, all expected: the 152 tests that move files
+  (applying is refused there), now including the 2 pin tests, plus the 2
+  Windows reserved-name tests. Everything else passes, the damaged-record
+  reading tests included.
+
+Nothing failed and nothing skipped for a reason that was not expected.
+
 Next, in order:
 
-1. Push the fixes and check that CI is green on every job.
+1. Merge this branch into `main`, whose last CI run is still red.
 2. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
