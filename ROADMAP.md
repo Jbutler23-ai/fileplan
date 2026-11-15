@@ -315,10 +315,17 @@ Ubuntu.
 
 Nothing failed and nothing skipped for a reason that was not expected.
 
-Next, in order:
+### Merged into main (2026-11-15)
 
-1. Merge this branch into `main`, whose last CI run is still red.
-2. The macOS decision above.
+The branch was fast-forwarded onto `main` at `006b3df`, six commits ahead
+of the last `main` push. CI on `main` itself,
+https://github.com/Jbutler23-ai/fileplan/actions/runs/43700987288, is green
+on all nine jobs, every step included. `main` had been red since
+2026-11-01.
+
+Next:
+
+1. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
 kind is changed to "apply" and whose link to the record it undid is removed
