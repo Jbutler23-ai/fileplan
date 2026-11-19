@@ -1,8 +1,12 @@
 # fileplan
 
-fileplan previews how a folder could be organized by file extension. It lists
-each proposed destination and flags names that would collide. The current
-version only makes a plan; it does not move, rename, delete, or open file contents.
+fileplan previews how a folder could be organized, by file extension or by
+your own rules, then applies the plan and can undo it. A preview lists each
+proposed destination and flags names that would collide; it never changes a
+file. Files only move when you ask with `--apply` and confirm, every run is
+recorded so it can be looked at with `--show` and undone with `--undo`, and
+fileplan never overwrites or deletes a file. Applying works on Linux and
+Windows; on macOS it is refused, and previewing works everywhere.
 
 It's a small command-line tool for people sorting their own project files or
 downloads. It uses Python 3.10 or newer and has no runtime dependencies.

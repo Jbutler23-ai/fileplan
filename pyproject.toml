@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fileplan"
 version = "0.1.0"
-description = "Preview file organization and find destination conflicts"
+description = "Preview, apply, and undo file organization without overwriting anything"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

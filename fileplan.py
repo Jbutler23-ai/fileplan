@@ -4063,7 +4063,11 @@ def _confirm_plan(plan: dict, reader: TextIO, writer: TextIO) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Preview files grouped by extension. Does not change any files."
+        description=(
+            "Preview how a folder would be organized, then apply the plan or undo "
+            "a run. A preview never changes any files; files move only with "
+            "--apply and a confirmation."
+        )
     )
     parser.add_argument("root", type=Path, help="directory to inspect")
     parser.add_argument(
