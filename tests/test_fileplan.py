@@ -2778,7 +2778,9 @@ class RulesTests(unittest.TestCase):
         bad = {
             "not json": "{nope",
             "a list": [],
-            "wrong version": {"schema_version": 2, "rules": []},
+            "wrong version": {"schema_version": 3, "rules": []},
+            "version as a boolean": {"schema_version": True, "rules": []},
+            "version as a float": {"schema_version": 2.0, "rules": []},
             "unknown top key": {"schema_version": 1, "rules": [], "fallbak": "by-extension"},
             "rules not a list": {"schema_version": 1, "rules": {}},
             "rule not an object": {"schema_version": 1, "rules": ["x"]},
@@ -2858,6 +2860,251 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(by_source["outline.md"]["destination"], "_organized/writing/outline.md")
         self.assertEqual(by_source["assets/colors.json"]["rule"], "assets")
         self.assertIsNone(by_source["notes.txt"]["rule"])
+        # The drafts folder is ignored, so its notes.txt no longer clashes.
+        self.assertNotIn("drafts/notes.txt", by_source)
+        self.assertEqual(by_source["notes.txt"]["status"], "ready")
+        self.assertEqual(
+            [e for e in plan["skipped"] if e["path"] == "drafts"],
+            [{"path": "drafts", "reason": 'Ignored by "drafts/"', "ignored_by": "drafts/"}],
+        )
+
+
+class IgnoreRulesTests(unittest.TestCase):
+    """Leaving files out of a plan by name. Every sample is made up."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name).resolve()
+        aside = tempfile.TemporaryDirectory()
+        self.addCleanup(aside.cleanup)
+        self.aside = Path(aside.name)
+
+    def write(self, name, content=b"pretend contents\n"):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def rules(self, ignore, rules=(), version=2):
+        document = {"schema_version": version, "ignore": ignore, "rules": list(rules)}
+        path = self.aside / "rules.json"
+        path.write_text(json.dumps(document))
+        return fileplan.load_rules(path)
+
+    def plan(self, ignore, **options):
+        return fileplan.build_plan(self.root, rules=self.rules(ignore), **options)
+
+    def run_cli(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = fileplan.main(list(args))
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def sources(self, plan):
+        return sorted(entry["source"] for entry in plan["entries"])
+
+    def skipped(self, plan):
+        return {entry["path"]: entry for entry in plan["skipped"]}
+
+    def test_a_name_pattern_ignores_files_at_any_depth_without_regard_to_case(self):
+        self.write("film.part")
+        self.write("deep/inside/Song.PART")
+        self.write("Thumbs.db")
+        self.write("deep/THUMBS.DB")
+        self.write("keep.txt")
+
+        plan = self.plan(["*.part", "thumbs.db"], recursive=True)
+
+        self.assertEqual(self.sources(plan), ["keep.txt"])
+        skipped = self.skipped(plan)
+        for path, pattern in [
+            ("film.part", "*.part"),
+            ("deep/inside/Song.PART", "*.part"),
+            ("Thumbs.db", "thumbs.db"),
+            ("deep/THUMBS.DB", "thumbs.db"),
+        ]:
+            self.assertEqual(skipped[path]["ignored_by"], pattern, path)
+            self.assertEqual(skipped[path]["reason"], f'Ignored by "{pattern}"')
+
+    def test_an_ignored_folder_is_not_entered_and_is_listed_once(self):
+        self.write("drafts/one.txt")
+        self.write("drafts/deeper/two.txt")
+        self.write("keep.txt")
+
+        plan = self.plan(["drafts"], recursive=True)
+
+        self.assertEqual(self.sources(plan), ["keep.txt"])
+        self.assertEqual(list(self.skipped(plan)), ["drafts"])
+
+    def test_a_trailing_slash_matches_folders_and_not_files(self):
+        self.write("notes/inside.txt")
+        self.write("other/notes")
+
+        plan = self.plan(["notes/"], recursive=True)
+
+        self.assertEqual(self.sources(plan), ["other/notes"])
+        self.assertEqual(self.skipped(plan)["notes"]["ignored_by"], "notes/")
+
+    def test_ignore_wins_over_folder_rules_and_the_first_matching_pattern_is_named(self):
+        self.write("report.pdf")
+        rules = self.rules(
+            ["*.pdf", "report*"],
+            [{"name": "papers", "extensions": ["pdf"], "folder": "papers"}],
+        )
+
+        plan = fileplan.build_plan(self.root, rules=rules)
+
+        self.assertEqual(plan["entries"], [])
+        self.assertEqual(self.skipped(plan)["report.pdf"]["ignored_by"], "*.pdf")
+
+    def test_an_entry_both_hidden_and_ignored_is_reported_as_ignored(self):
+        self.write(".cache.part")
+        plan = self.plan(["*.part"])
+        self.assertEqual(self.skipped(plan)[".cache.part"]["ignored_by"], "*.part")
+
+    def test_built_in_skips_come_before_ignore_rules(self):
+        self.write("node_modules/x.js")
+        self.write("_organized/old.txt")
+        plan = self.plan(["node_modules", "_organized", "*"], recursive=True)
+        skipped = self.skipped(plan)
+        self.assertEqual(skipped["node_modules"]["reason"], "Metadata, dependency, or cache directory")
+        self.assertEqual(skipped["_organized"]["reason"], "Destination directory")
+        self.assertNotIn("ignored_by", skipped["node_modules"])
+        self.assertNotIn("ignored_by", skipped["_organized"])
+
+    def test_ignoring_never_hides_a_taken_destination(self):
+        # The rule's folder and the file already in it match the ignore list,
+        # but ignore applies to sources only, so the clash is still found.
+        self.write("taken.txt", b"new contents")
+        self.write("_organized/txt/taken.txt", b"already here")
+
+        plan = self.plan(["txt/", "_organized"])
+
+        self.assertEqual(plan["entries"][0]["status"], "conflict")
+        self.assertIn("Destination already exists", plan["entries"][0]["reason"])
+
+    def test_ignoring_changes_nothing_on_disk(self):
+        self.write("film.part", b"half a film")
+        self.write("keep.txt", b"keep me")
+        before = sorted((p.relative_to(self.root).as_posix(), p.read_bytes())
+                        for p in self.root.rglob("*") if p.is_file())
+        rules_path = self.aside / "rules.json"
+        rules_path.write_text(json.dumps({"schema_version": 2, "ignore": ["*.part"], "rules": []}))
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--rules", str(rules_path))
+
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("1 ignore pattern", stdout)
+        self.assertIn("Skipped 1 entries (1 by ignore rules):", stdout)
+        self.assertIn('"film.part": Ignored by "*.part"', stdout)
+        after = sorted((p.relative_to(self.root).as_posix(), p.read_bytes())
+                       for p in self.root.rglob("*") if p.is_file())
+        self.assertEqual(after, before)
+
+    def test_json_output_names_the_pattern(self):
+        self.write("film.part")
+        rules_path = self.aside / "rules.json"
+        rules_path.write_text(json.dumps({"schema_version": 2, "ignore": ["*.part"], "rules": []}))
+
+        code, stdout, stderr = self.run_cli(str(self.root), "--rules", str(rules_path), "--format", "json")
+
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout)
+        self.assertEqual(plan["options"]["rules"]["ignore"], ["*.part"])
+        self.assertEqual(
+            plan["skipped"],
+            [{"path": "film.part", "reason": 'Ignored by "*.part"', "ignored_by": "*.part"}],
+        )
+
+    def test_a_saved_plan_keeps_its_ignore_list_for_verify(self):
+        self.write("film.part")
+        self.write("keep.txt")
+        plan_path = self.aside / "plan.json"
+        plan_path.write_text(json.dumps(self.plan(["*.part"])))
+
+        saved = fileplan.load_plan(plan_path)
+        report = fileplan.verify_plan(saved, self.root, plan_path)
+
+        self.assertEqual(saved["options"]["rules"]["ignore"], ["*.part"])
+        self.assertEqual([r["source"] for r in report["entries"]], ["keep.txt"])
+        self.assertEqual(report["summary"]["problems"], 0)
+
+    def test_a_file_ignored_after_planning_is_reported_missing_by_verify(self):
+        # The plan stores its rules, so editing them in the plan changes what
+        # a rebuild sees, and the file that dropped out is named with why.
+        self.write("film.part")
+        plan = self.plan([])
+        plan["options"]["rules"]["ignore"] = ["*.part"]
+        plan_path = self.aside / "plan.json"
+        plan_path.write_text(json.dumps(plan))
+
+        report = fileplan.verify_plan(fileplan.load_plan(plan_path), self.root, plan_path)
+
+        self.assertEqual(report["entries"][0]["status"], "missing")
+        self.assertIn('Ignored by "*.part"', report["entries"][0]["reason"])
+
+    def test_version_1_files_still_work_and_are_stored_as_before(self):
+        self.write("photo.jpg")
+        path = self.aside / "v1.json"
+        path.write_text(json.dumps(
+            {"schema_version": 1, "rules": [{"name": "img", "extensions": ["jpg"], "folder": "images"}]}
+        ))
+
+        rules = fileplan.load_rules(path)
+        plan = fileplan.build_plan(self.root, rules=rules)
+
+        self.assertEqual(rules, {
+            "schema_version": 1,
+            "rules": [{"name": "img", "folder": "images", "extensions": ["jpg"], "patterns": []}],
+            "fallback": "by-extension",
+        })
+        self.assertEqual(plan["entries"][0]["destination"], "_organized/images/photo.jpg")
+
+    def test_a_version_2_file_without_ignore_ignores_nothing(self):
+        self.write("film.part")
+        path = self.aside / "v2.json"
+        path.write_text(json.dumps({"schema_version": 2, "rules": []}))
+        plan = fileplan.build_plan(self.root, rules=fileplan.load_rules(path))
+        self.assertEqual(self.sources(plan), ["film.part"])
+        self.assertEqual(plan["options"]["rules"]["ignore"], [])
+
+    def test_invalid_ignore_lists_are_refused_before_any_plan_is_made(self):
+        self.write("film.part")
+        bad = {
+            "ignore in version 1": {"schema_version": 1, "ignore": ["*.part"], "rules": []},
+            "not a list": {"schema_version": 2, "ignore": "*.part", "rules": []},
+            "not strings": {"schema_version": 2, "ignore": [3], "rules": []},
+            "empty": {"schema_version": 2, "ignore": [""], "rules": []},
+            "only a slash": {"schema_version": 2, "ignore": ["/"], "rules": []},
+            "path pattern": {"schema_version": 2, "ignore": ["drafts/old-*"], "rules": []},
+            "leading slash": {"schema_version": 2, "ignore": ["/drafts"], "rules": []},
+            "two trailing slashes": {"schema_version": 2, "ignore": ["drafts//"], "rules": []},
+            "backslash": {"schema_version": 2, "ignore": ["a\\b"], "rules": []},
+            "colon": {"schema_version": 2, "ignore": ["c:x"], "rules": []},
+            "dot dot": {"schema_version": 2, "ignore": [".."], "rules": []},
+            "dot": {"schema_version": 2, "ignore": ["./"], "rules": []},
+            "control char": {"schema_version": 2, "ignore": ["a\u0001"], "rules": []},
+            "listed twice": {"schema_version": 2, "ignore": ["*.part", "*.PART"], "rules": []},
+        }
+        for label, document in bad.items():
+            with self.subTest(ignore=label):
+                path = self.aside / "bad.json"
+                path.write_text(json.dumps(document))
+                code, stdout, stderr = self.run_cli(str(self.root), "--rules", str(path))
+                self.assertEqual(code, 2, stderr)
+                self.assertEqual(stdout, "")
+                self.assertIn("ignore", stderr)
+                self.assertNotIn("Traceback", stderr)
+
+    def test_a_saved_plan_with_a_bad_ignore_list_is_refused(self):
+        self.write("film.part")
+        plan = self.plan(["*.part"])
+        plan["options"]["rules"]["ignore"] = ["drafts/old-*"]
+        plan_path = self.aside / "plan.json"
+        plan_path.write_text(json.dumps(plan))
+        with self.assertRaises(fileplan.FilePlanError):
+            fileplan.load_plan(plan_path)
 
 
 @unittest.skipUnless(
@@ -2865,6 +3112,33 @@ class RulesTests(unittest.TestCase):
 )
 class RulesApplyTests(_ApplyFixture):
     """Applying and undoing with nested rule folders. Every sample is made up."""
+
+    def test_an_ignored_file_stays_where_it_is_through_apply_and_undo(self):
+        self.write("film.part", b"half a film")
+        self.write("drafts/keep-out.txt", b"draft")
+        self.write("notes.txt", b"pretend notes")
+        before = self.tree()
+        rules_path = self.plans / "rules.json"
+        rules_path.write_text(json.dumps({"schema_version": 2, "ignore": ["*.part", "drafts/"], "rules": []}))
+        plan = fileplan.build_plan(self.root, recursive=True, rules=fileplan.load_rules(rules_path))
+        plan_path = self.plans / "plan.json"
+        plan_path.write_text(json.dumps(plan))
+
+        applied = self.apply(plan_path)
+
+        self.assertTrue(applied["summary"]["completed"])
+        self.assertEqual(
+            self.tree(),
+            {
+                "film.part": b"half a film",
+                "drafts/keep-out.txt": b"draft",
+                "_organized/txt/notes.txt": b"pretend notes",
+            },
+        )
+        record = fileplan.load_record(Path(applied["record"]["path"]))
+        undone = fileplan.undo_record(record, self.root, Path(applied["record"]["path"]))
+        self.assertTrue(undone["summary"]["completed"])
+        self.assertEqual(self.tree(), before)
 
     def test_apply_and_undo_round_trip_with_nested_rule_folders(self):
         self.write("invoice-9.pdf", b"pretend invoice")

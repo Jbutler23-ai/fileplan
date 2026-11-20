@@ -102,7 +102,8 @@ fileplan examples/inbox --recursive --rules examples/rules.json
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "ignore": ["*.part", "*.crdownload", "thumbs.db", "keep-as-is/"],
   "rules": [
     {"name": "invoices", "extensions": ["pdf"], "patterns": ["invoice-*"],
      "folder": "finance/invoices"},
@@ -127,6 +128,28 @@ them by extension as usual; `{"folder": "other"}` sends them all to one folder.
 Each entry in the plan records which rule chose it under `rule`, which is
 `null` for extension grouping and `"fallback"` for the fallback folder; the
 plain output shows it after each line.
+
+### Ignoring files and folders
+
+`ignore` lists names to leave out of the plan entirely, such as partial
+downloads or a folder to leave alone. It needs `schema_version` 2; a version 1
+file works exactly as before, and `ignore` in one is refused. Patterns use the
+same shell-style wildcards as `patterns`, matched without regard to case
+against the name of each file or folder at any depth: `thumbs.db` ignores
+every `Thumbs.db`. A pattern ending in `/` matches folders only, and an
+ignored folder is not entered, so nothing under it is planned. Patterns with
+any other slash, which would match a path, are not supported yet and are
+refused, as are empty patterns, backslashes, colons, control characters,
+`.` and `..`, and a pattern listed twice.
+
+Ignoring only removes files from the plan; an ignored file is never moved and
+stays exactly where it is. Ignore wins over folder rules. It applies to the
+files being sorted only, never to what is already inside `_organized`, so it
+cannot make a taken destination look free. Every ignored entry is listed
+under `skipped` with the reason `Ignored by "<pattern>"` and, in JSON, the
+pattern under `ignored_by`. Links, `_organized`, and the built-in
+metadata and cache folders are skipped before ignore patterns are checked;
+an entry both hidden and ignored is reported as ignored.
 
 A rules file is checked completely before any plan is made, and an invalid one
 is refused with exit status 2 and a message naming the rule and the problem.

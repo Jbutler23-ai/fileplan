@@ -1,5 +1,14 @@
 # Plan: ignore rules
 
+**Status (2026-11-20):** filename patterns are built: an `ignore` list in
+rules schema version 2, name patterns at any depth, a trailing `/` for
+folders only, reported under `skipped` with `ignored_by`. Path patterns
+(with a slash inside) are refused for now and are the remaining part of this
+plan. The four questions below were not formally answered; this build
+follows the recommendations (a rules-file key, the narrow pattern language,
+ignored entries listed one by one, no `--ignore` option yet), and any of
+those can still be changed.
+
 A proposal, not built yet. It lets a user keep chosen files and folders out
 of a plan, such as partial downloads, `Thumbs.db`, or a folder they want left
 alone. Nothing here changes how a move, an undo, or a run record works.

@@ -170,11 +170,57 @@ class _DirectorySnapshot:
         return None
 
 
-RULES_SCHEMA_VERSION = 1
+RULES_SCHEMA_VERSION = 2
+RULES_SCHEMA_VERSIONS = (1, 2)
 NO_EXTENSION = "no-extension"
 FALLBACK_RULE = "fallback"
 _RULE_KEYS = frozenset({"name", "folder", "extensions", "patterns"})
-_RULES_KEYS = frozenset({"schema_version", "rules", "fallback"})
+_RULES_KEYS = frozenset({"schema_version", "ignore", "rules", "fallback"})
+
+
+def _normalise_ignore(patterns: object, reject) -> list[str]:
+    """Check an ignore list; return its patterns as written.
+
+    Only filename patterns are accepted for now: a pattern may end with one
+    slash to match folders only, and any other slash is refused.
+    """
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        reject("ignore must be a list of strings")
+    seen: set[str] = set()
+    for pattern in patterns:
+        label = f"ignore pattern {pattern!r}"
+        name = pattern[:-1] if pattern.endswith("/") else pattern
+        if not name:
+            reject(f"{label} is empty")
+        if any(ord(character) < 32 for character in pattern):
+            reject(f"{label} contains a control character")
+        if "\\" in pattern or ":" in pattern:
+            reject(f"{label} must not contain a backslash or colon")
+        if "/" in name:
+            reject(
+                f"{label} contains a slash; only filename patterns are supported, "
+                "optionally ending in '/' to match folders only"
+            )
+        if name in (".", ".."):
+            reject(f"{label} is not a name")
+        if pattern.casefold() in seen:
+            reject(f"{label} is listed twice")
+        seen.add(pattern.casefold())
+    return list(patterns)
+
+
+def _ignored_by(name: str, is_directory: bool, rules: dict | None) -> str | None:
+    """Return the ignore pattern that matches this entry's name, or None."""
+    if rules is None:
+        return None
+    lowered = name.casefold()
+    for pattern in rules.get("ignore", ()):
+        folders_only = pattern.endswith("/")
+        if folders_only and not is_directory:
+            continue
+        if fnmatch.fnmatchcase(lowered, pattern.rstrip("/").casefold()):
+            return pattern
+    return None
 
 
 def _folder_problem(folder: object) -> str | None:
@@ -205,9 +251,13 @@ def _normalise_rules(data: object, where: str) -> dict:
         reject("the top level is not an object")
     unknown = set(data) - _RULES_KEYS
     if unknown:
-        reject(f"unknown key {sorted(unknown)[0]!r}; allowed keys are schema_version, rules, fallback")
-    if data.get("schema_version") != RULES_SCHEMA_VERSION:
-        reject(f"schema_version must be {RULES_SCHEMA_VERSION}, found {data.get('schema_version')!r}")
+        reject(f"unknown key {sorted(unknown)[0]!r}; allowed keys are schema_version, ignore, rules, fallback")
+    version = data.get("schema_version")
+    if type(version) is not int or version not in RULES_SCHEMA_VERSIONS:
+        reject(f"schema_version must be 1 or 2, found {version!r}")
+    if version == 1 and "ignore" in data:
+        reject("ignore needs schema_version 2")
+    ignore = _normalise_ignore(data.get("ignore", []), reject) if version == 2 else None
     rules = data.get("rules")
     if not isinstance(rules, list):
         reject("rules must be a list")
@@ -264,7 +314,11 @@ def _normalise_rules(data: object, where: str) -> dict:
         fallback = {"folder": "/".join(_relative_parts(fallback["folder"]))}
     else:
         reject("fallback must be \"by-extension\" or an object with only a folder")
-    return {"schema_version": RULES_SCHEMA_VERSION, "rules": normalised, "fallback": fallback}
+    if version == 1:
+        # A version 1 file is stored exactly as before, so plans made from one
+        # read the same to an older fileplan.
+        return {"schema_version": 1, "rules": normalised, "fallback": fallback}
+    return {"schema_version": 2, "ignore": ignore, "rules": normalised, "fallback": fallback}
 
 
 def load_rules(path: Path) -> dict:
@@ -569,12 +623,15 @@ def build_plan(
             relative = path.relative_to(root).as_posix()
             is_directory = stat.S_ISDIR(metadata.st_mode)
             reason = None
+            ignored_by = None
             if _is_link(metadata):
                 reason = "Symbolic link or reparse point"
             elif is_directory and name.casefold() == DESTINATION_NAME:
                 reason = "Destination directory"
             elif is_directory and name.casefold() in IGNORED_DIRECTORIES:
                 reason = "Metadata, dependency, or cache directory"
+            elif (ignored_by := _ignored_by(name, is_directory, rules)) is not None:
+                reason = f"Ignored by {_quote(ignored_by)}"
             elif not include_hidden and _is_hidden(name, metadata):
                 reason = "Hidden entry"
             elif is_directory:
@@ -602,6 +659,8 @@ def build_plan(
                 reason = "Not a regular file"
             if reason:
                 skipped.append({"path": relative, "reason": reason})
+                if ignored_by is not None:
+                    skipped[-1]["ignored_by"] = ignored_by
 
     entries.sort(key=lambda entry: _path_order(entry["source"]))
     skipped.sort(key=lambda entry: _path_order(entry["path"]))
@@ -3603,8 +3662,10 @@ def _plain_output(plan: dict) -> str:
             else f"go to {_quote(fallback['folder'])}"
         )
         count = len(rules["rules"])
+        ignores = len(rules.get("ignore") or ())
         lines.append(
             f"Rules: {count} custom rule{'s' if count != 1 else ''}; unmatched files {unmatched}"
+            + (f"; {ignores} ignore pattern{'s' if ignores != 1 else ''}" if ignores else "")
         )
     for entry in plan["entries"]:
         # JSON quoting keeps newlines and other filename controls on one line.
@@ -3621,7 +3682,12 @@ def _plain_output(plan: dict) -> str:
             line += f" ({_quote(entry['reason'])})"
         lines.append(line)
     if plan["skipped"]:
-        lines.append(f"Skipped {len(plan['skipped'])} entries:")
+        ignored = sum("ignored_by" in entry for entry in plan["skipped"])
+        lines.append(
+            f"Skipped {len(plan['skipped'])} entries"
+            + (f" ({ignored} by ignore rules)" if ignored else "")
+            + ":"
+        )
         for entry in plan["skipped"]:
             path = _quote(entry["path"])
             lines.append(f"  {path}: {entry['reason']}")

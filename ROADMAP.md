@@ -332,6 +332,8 @@ pick it up.
    `origin/hfi/f1a6cffa-25a3-4b2c-b929-79bbc1c0f39a/oak` branch, that an
    unreadable file still moves. Bring the test change onto `main` if it holds.
 2. Ignore rules, planned in [PLAN-ignore-rules.md](PLAN-ignore-rules.md).
+   Filename patterns are built (rules schema version 2, version 1
+   unchanged); path patterns are left.
 3. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose
