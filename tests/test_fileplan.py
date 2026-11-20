@@ -2946,6 +2946,55 @@ class IgnoreRulesTests(unittest.TestCase):
         self.assertEqual(self.sources(plan), ["other/notes"])
         self.assertEqual(self.skipped(plan)["notes"]["ignored_by"], "notes/")
 
+    def test_a_path_pattern_is_anchored_and_star_stays_inside_one_folder(self):
+        self.write("drafts/old-notes.txt")
+        self.write("drafts/2026/old-notes.txt")
+        self.write("old-notes.txt")
+        self.write("inside/drafts/old-notes.txt")
+
+        plan = self.plan(["drafts/old-*"], recursive=True)
+
+        # Only the anchored, single-level match is ignored: not the same name
+        # at the top, deeper inside drafts, or under another folder.
+        self.assertEqual(
+            self.sources(plan),
+            ["drafts/2026/old-notes.txt", "inside/drafts/old-notes.txt", "old-notes.txt"],
+        )
+        self.assertEqual(self.skipped(plan)["drafts/old-notes.txt"]["ignored_by"], "drafts/old-*")
+
+    def test_a_star_part_matches_one_folder_level_not_a_path(self):
+        self.write("logs/app.log")
+        self.write("logs/2026/app.log")
+        self.write("stale/kept.txt")
+
+        plan = self.plan(["logs/*.log", "*/kept.txt"], recursive=True)
+
+        # Plain fnmatch on the whole path would let * swallow "2026/".
+        self.assertEqual(self.sources(plan), ["logs/2026/app.log"])
+        skipped = self.skipped(plan)
+        self.assertEqual(skipped["logs/app.log"]["ignored_by"], "logs/*.log")
+        self.assertEqual(skipped["stale/kept.txt"]["ignored_by"], "*/kept.txt")
+
+    def test_a_path_pattern_ignores_a_folder_which_is_not_entered(self):
+        self.write("projects/archive/deep/a.txt")
+        self.write("archive/b.txt")
+
+        plan = self.plan(["projects/arch*/"], recursive=True)
+
+        self.assertEqual(self.sources(plan), ["archive/b.txt"])
+        self.assertEqual(list(self.skipped(plan)), ["projects/archive"])
+
+    def test_a_path_pattern_with_a_trailing_slash_matches_folders_only(self):
+        self.write("drafts/old")
+        self.write("other/drafts/ignored-anyway.txt")
+
+        plan = self.plan(["drafts/old/"], recursive=True)
+
+        self.assertEqual(
+            self.sources(plan),
+            ["drafts/old", "other/drafts/ignored-anyway.txt"],
+        )
+
     def test_ignore_wins_over_folder_rules_and_the_first_matching_pattern_is_named(self):
         self.write("report.pdf")
         rules = self.rules(
@@ -3077,7 +3126,9 @@ class IgnoreRulesTests(unittest.TestCase):
             "not strings": {"schema_version": 2, "ignore": [3], "rules": []},
             "empty": {"schema_version": 2, "ignore": [""], "rules": []},
             "only a slash": {"schema_version": 2, "ignore": ["/"], "rules": []},
-            "path pattern": {"schema_version": 2, "ignore": ["drafts/old-*"], "rules": []},
+            "empty middle part": {"schema_version": 2, "ignore": ["a//b"], "rules": []},
+            "dot part": {"schema_version": 2, "ignore": ["a/./b"], "rules": []},
+            "dot dot part": {"schema_version": 2, "ignore": ["a/../b"], "rules": []},
             "leading slash": {"schema_version": 2, "ignore": ["/drafts"], "rules": []},
             "two trailing slashes": {"schema_version": 2, "ignore": ["drafts//"], "rules": []},
             "backslash": {"schema_version": 2, "ignore": ["a\\b"], "rules": []},
@@ -3100,7 +3151,7 @@ class IgnoreRulesTests(unittest.TestCase):
     def test_a_saved_plan_with_a_bad_ignore_list_is_refused(self):
         self.write("film.part")
         plan = self.plan(["*.part"])
-        plan["options"]["rules"]["ignore"] = ["drafts/old-*"]
+        plan["options"]["rules"]["ignore"] = ["drafts//old-*"]
         plan_path = self.aside / "plan.json"
         plan_path.write_text(json.dumps(plan))
         with self.assertRaises(fileplan.FilePlanError):

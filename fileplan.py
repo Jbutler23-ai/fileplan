@@ -181,8 +181,9 @@ _RULES_KEYS = frozenset({"schema_version", "ignore", "rules", "fallback"})
 def _normalise_ignore(patterns: object, reject) -> list[str]:
     """Check an ignore list; return its patterns as written.
 
-    Only filename patterns are accepted for now: a pattern may end with one
-    slash to match folders only, and any other slash is refused.
+    A pattern without a slash matches a name at any depth; a pattern with
+    slashes matches a path from the scanned folder, one part per folder
+    level. A trailing slash matches folders only.
     """
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
         reject("ignore must be a list of strings")
@@ -196,29 +197,41 @@ def _normalise_ignore(patterns: object, reject) -> list[str]:
             reject(f"{label} contains a control character")
         if "\\" in pattern or ":" in pattern:
             reject(f"{label} must not contain a backslash or colon")
-        if "/" in name:
+        parts = name.split("/")
+        if any(part == "" for part in parts):
             reject(
-                f"{label} contains a slash; only filename patterns are supported, "
-                "optionally ending in '/' to match folders only"
+                f"{label} has an empty part; one slash between names, none at "
+                "the start, and at most one at the end to match folders only"
             )
-        if name in (".", ".."):
-            reject(f"{label} is not a name")
+        if any(part in (".", "..") for part in parts):
+            reject(f"{label} must not contain a '.' or '..' part")
         if pattern.casefold() in seen:
             reject(f"{label} is listed twice")
         seen.add(pattern.casefold())
     return list(patterns)
 
 
-def _ignored_by(name: str, is_directory: bool, rules: dict | None) -> str | None:
-    """Return the ignore pattern that matches this entry's name, or None."""
+def _ignored_by(relative: str, is_directory: bool, rules: dict | None) -> str | None:
+    """Return the ignore pattern that matches this entry, or None.
+
+    ``relative`` is the entry's path from the scanned folder. A pattern
+    without a slash is matched against the entry's name at any depth; a
+    pattern with slashes is matched part by part from the scanned folder, so
+    ``*`` never crosses a folder boundary and ``drafts/old-*`` does not match
+    ``drafts/2026/old-notes.txt``.
+    """
     if rules is None:
         return None
-    lowered = name.casefold()
+    parts = relative.casefold().split("/")
     for pattern in rules.get("ignore", ()):
         folders_only = pattern.endswith("/")
         if folders_only and not is_directory:
             continue
-        if fnmatch.fnmatchcase(lowered, pattern.rstrip("/").casefold()):
+        wanted = pattern.rstrip("/").casefold().split("/")
+        against = parts if len(wanted) > 1 else parts[-1:]
+        if len(wanted) == len(against) and all(
+            fnmatch.fnmatchcase(part, want) for part, want in zip(against, wanted)
+        ):
             return pattern
     return None
 
@@ -630,7 +643,7 @@ def build_plan(
                 reason = "Destination directory"
             elif is_directory and name.casefold() in IGNORED_DIRECTORIES:
                 reason = "Metadata, dependency, or cache directory"
-            elif (ignored_by := _ignored_by(name, is_directory, rules)) is not None:
+            elif (ignored_by := _ignored_by(relative, is_directory, rules)) is not None:
                 reason = f"Ignored by {_quote(ignored_by)}"
             elif not include_hidden and _is_hidden(name, metadata):
                 reason = "Hidden entry"

@@ -331,9 +331,10 @@ pick it up.
 1. Review the test in `a6a5038`, available through the remote-tracking
    `origin/hfi/f1a6cffa-25a3-4b2c-b929-79bbc1c0f39a/oak` branch, that an
    unreadable file still moves. Bring the test change onto `main` if it holds.
-2. Ignore rules, planned in [PLAN-ignore-rules.md](PLAN-ignore-rules.md).
-   Filename patterns are built (rules schema version 2, version 1
-   unchanged); path patterns are left.
+2. Ignore rules are built, as planned in
+   [PLAN-ignore-rules.md](PLAN-ignore-rules.md): filename and path patterns
+   in rules schema version 2, with version 1 unchanged. Left out on purpose:
+   negation, `**`, a `--ignore` option, and un-ignoring built-in folders.
 3. The macOS decision above.
 
 One gap is known and cannot be closed from the record alone: an undo whose

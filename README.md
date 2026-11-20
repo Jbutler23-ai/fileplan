@@ -103,7 +103,7 @@ fileplan examples/inbox --recursive --rules examples/rules.json
 ```json
 {
   "schema_version": 2,
-  "ignore": ["*.part", "*.crdownload", "thumbs.db", "keep-as-is/"],
+  "ignore": ["*.part", "*.crdownload", "thumbs.db", "keep-as-is/", "drafts/old-*"],
   "rules": [
     {"name": "invoices", "extensions": ["pdf"], "patterns": ["invoice-*"],
      "folder": "finance/invoices"},
@@ -134,13 +134,17 @@ plain output shows it after each line.
 `ignore` lists names to leave out of the plan entirely, such as partial
 downloads or a folder to leave alone. It needs `schema_version` 2; a version 1
 file works exactly as before, and `ignore` in one is refused. Patterns use the
-same shell-style wildcards as `patterns`, matched without regard to case
-against the name of each file or folder at any depth: `thumbs.db` ignores
-every `Thumbs.db`. A pattern ending in `/` matches folders only, and an
-ignored folder is not entered, so nothing under it is planned. Patterns with
-any other slash, which would match a path, are not supported yet and are
-refused, as are empty patterns, backslashes, colons, control characters,
-`.` and `..`, and a pattern listed twice.
+same shell-style wildcards as `patterns`, matched without regard to case.
+
+A pattern without a slash matches the name of a file or folder at any depth:
+`thumbs.db` ignores every `Thumbs.db`. A pattern with slashes matches a path
+from the scanned folder, one part per folder level, so `drafts/old-*` ignores
+`drafts/old-notes.txt` but not `drafts/2026/old-notes.txt` or a top-level
+`old-notes.txt`; `*` and the other wildcards never cross a folder boundary.
+A pattern ending in `/` matches folders only, and an ignored folder is not
+entered, so nothing under it is planned. Refused with a message naming the
+pattern: an empty pattern or part, a leading slash, a `.` or `..` part, a
+backslash, a colon, a control character, and a pattern listed twice.
 
 Ignoring only removes files from the plan; an ignored file is never moved and
 stays exactly where it is. Ignore wins over folder rules. It applies to the

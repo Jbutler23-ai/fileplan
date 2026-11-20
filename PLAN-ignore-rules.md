@@ -1,13 +1,14 @@
 # Plan: ignore rules
 
-**Status (2026-11-20):** filename patterns are built: an `ignore` list in
-rules schema version 2, name patterns at any depth, a trailing `/` for
-folders only, reported under `skipped` with `ignored_by`. Path patterns
-(with a slash inside) are refused for now and are the remaining part of this
-plan. The four questions below were not formally answered; this build
+**Status (2026-11-20):** built as planned: an `ignore` list in rules schema
+version 2, name patterns at any depth, path patterns anchored to the scanned
+folder and matched one part per folder level so `*` never crosses a folder
+boundary, a trailing `/` for folders only, reported under `skipped` with
+`ignored_by`. The four questions below were not formally answered; this build
 follows the recommendations (a rules-file key, the narrow pattern language,
 ignored entries listed one by one, no `--ignore` option yet), and any of
-those can still be changed.
+those can still be changed. Negation, `**`, and un-ignoring built-in folders
+stay left out, as planned below.
 
 A proposal, not built yet. It lets a user keep chosen files and folders out
 of a plan, such as partial downloads, `Thumbs.db`, or a folder they want left
